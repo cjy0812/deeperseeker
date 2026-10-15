@@ -41,7 +41,8 @@ python tests/test_token_pool.py  # 每个测试文件也可直接运行
 - **`app.py`**（约 2.5K 行）—— FastAPI 接口层。所有 HTTP 路由、两个流式写出器（OpenAI 用 `stream_response`，Anthropic 用 `stream_anthropic_response`）、请求/响应格式转换、dashboard 与管理端鉴权，以及核心编排函数 `handle_chat`。
 - **`functions.py`**（约 2K 行）—— 上游客户端与 SQLite 存储。与 `chat.deepseek.com` 通信，管理 token 池、PoW 挑战求解、cookie 生成、会话持久化、文件上传与 SSE 解析。`StreamToolParser` 和多格式工具调用解析也在这里。
 - **`plugin_helper.py`** —— 提示词构造与上下文策略。规范化/消息签名、历史 token 预算、摘要式滚动（summarize-and-rollover）触发条件、附件描述、文件抽取与上传。上下文窗口行为在这里，不在 `app.py`。
-- **`middleware.py`** —— `RealIPMiddleware`（由 `TRUSTED_PROXIES` 控制的 X-Forwarded-For 解析）、`RequestIDMiddleware`、`RecovererMiddleware`（把未处理异常转成 JSON 错误而不是裸 500）。
+- **`middleware.py`** —— `RealIPMiddleware`（由 `TRUSTED_PROXIES` 控制的 X-Forwarded-For 解析）、`RequestIDMiddleware`、`RecovererMiddleware`（把未处理异常转成 JSON 错误而不是裸 500）。`RequestIDMiddleware` 还通过 `audit.bind_request()` 把 request_id / endpoint / scope / model 绑到 ContextVar 上。
+- **`audit.py`** —— 审计与性能事件存储。**刻意不 import 项目里任何其他模块**（`functions.py` 要 import 它，反向 import 会成环），自行按 `DB_PATH` 解析出同一个 SQLite 库。写路径 best-effort（`record()` 吞掉所有异常，只留一行 stderr），读路径故意会抛（`/v1/audit/*` 据此返回 503，好让运维分得清「库坏了」和「窗口内无事件」）。
 
 ### 请求流程
 
