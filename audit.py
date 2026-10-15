@@ -422,6 +422,10 @@ def perf_summary(window=3600):
             "avg": totals["avg_latency_ms"],
             "p50": _percentile(latencies, 0.50),
             "p95": _percentile(latencies, 0.95),
+            # p99 is computed off the same sorted list the other percentiles
+            # use — the audit page surfaces it, and a separate query for one
+            # more index would double the scan for no gain.
+            "p99": _percentile(latencies, 0.99),
             "max": totals["max_latency_ms"],
         },
         "counters": counters,
