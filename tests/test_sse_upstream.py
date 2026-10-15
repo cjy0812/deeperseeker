@@ -224,7 +224,7 @@ def test_handle_chat_retries_empty_sse_on_parent_zero():
             ("send_message", fake_send),
             ("extract_and_upload_files", fake_files),
             ("build_prompt", fake_prompt),
-            ("mark_limited", lambda tid: None),
+            ("mark_limited", lambda tid, **k: None),
             ("mark_active", lambda tid: None),
             ("delete_sessions_for_chat", lambda *a: None),
             ("save_session", lambda *a: None),
@@ -303,7 +303,7 @@ def test_handle_chat_rotates_to_another_token_on_429():
     async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
         return "prompt"
 
-    def fake_limited(tid):
+    def fake_limited(tid, **kwargs):
         calls["limited"].append(tid)
 
     patches = [

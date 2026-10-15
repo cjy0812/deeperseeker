@@ -197,7 +197,7 @@ def test_chat_prefers_file_owner_token_on_first_turn():
             ("create_new_chat", fake_create_chat),
             ("extract_and_upload_files", fake_files),
             ("build_prompt", fake_prompt),
-            ("mark_limited", lambda tid: None),
+            ("mark_limited", lambda tid, **k: None),
             ("mark_active", lambda tid: None),
             ("delete_sessions_for_chat", lambda *a: None),
             ("save_session", fake_save),

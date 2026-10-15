@@ -24,6 +24,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from uvicorn.logging import AccessFormatter
 
+import audit
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # B12 (Stage 1 audit): the global os.chdir(BASE_DIR) is gone — every relative
 # path resolves from BASE_DIR explicitly. Import-time process-wide state is
@@ -492,6 +494,22 @@ def _upstream_http_code(exc):
     if isinstance(status, int) and 400 <= status <= 599:
         return status
     return None
+
+
+def _rate_limit_reason(exc):
+    """The audit vocabulary for WHY a token was marked RATE_LIMITED.
+
+    A real HTTP 429 and a `rate_limit_reached` event inside an otherwise-200
+    SSE body both reach the callers below as status 429; only
+    UpstreamError.origin tells them apart, and audit.token_rate_limit_summary()
+    keys its breakdown on exactly these strings. Non-429 statuses keep the
+    plain `http_<code>` shape that view also matches on (http_4%).
+    """
+    code = _upstream_http_code(exc)
+    origin = getattr(exc, "origin", "http")
+    if code == 429 and origin == "sse":
+        return "sse_rate_limit"
+    return f"http_{code}" if code else None
 
 
 def _api_error_response(e, is_anthropic=False):
@@ -1115,7 +1133,10 @@ async def handle_chat(
     except Exception as e:
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            # reason= is the audit vocabulary: a real HTTP 429 and an SSE
+            # rate_limit_reached event both arrive here as 429, and only
+            # UpstreamError.origin separates them for the audit breakdown.
+            await _db(mark_limited, token_id, reason=_rate_limit_reason(e))
             await _db(delete_sessions_for_chat, token_id, session_id)
             if not _auth_rotated:
                 new_token_id = await _db(pick_token)
@@ -1340,7 +1361,10 @@ async def stream_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            # reason= is the audit vocabulary: a real HTTP 429 and an SSE
+            # rate_limit_reached event both arrive here as 429, and only
+            # UpstreamError.origin separates them for the audit breakdown.
+            await _db(mark_limited, token_id, reason=_rate_limit_reason(e))
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
         else:
@@ -1512,7 +1536,10 @@ async def stream_anthropic_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            # reason= is the audit vocabulary: a real HTTP 429 and an SSE
+            # rate_limit_reached event both arrive here as 429, and only
+            # UpstreamError.origin separates them for the audit breakdown.
+            await _db(mark_limited, token_id, reason=_rate_limit_reason(e))
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
         else:
@@ -2501,6 +2528,46 @@ async def health(request: Request):
         data["active_tokens"] = active
         data["cookies_valid"] = cookies_valid
     return JSONResponse(data, status_code=200 if ok else 503)
+
+
+@app.get("/v1/audit/perf")
+async def audit_perf(request: Request, window: int = 3600):
+    """Perf status: request volume, error rate, latency percentiles and the
+    recovery counters over the trailing `window` seconds.
+
+    Gated by the API key (like /health's detail block) rather than the admin
+    session, so an operator can scrape it from the same client that talks to
+    the proxy. Read-only, best-effort: an audit-store failure is a 503, never
+    a 500, since the data is diagnostic."""
+    if not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    try:
+        summary = await _db(audit.perf_summary, window)
+    except Exception:
+        logger.exception("audit perf summary failed")
+        return JSONResponse({"error": "audit store unavailable"}, status_code=503)
+    summary["enabled"] = audit.enabled()
+    return JSONResponse(summary)
+
+
+@app.get("/v1/audit/rate-limits")
+async def audit_rate_limits(request: Request, since: float = None):
+    """The upstream rate-limit audit view: one row per token limited inside
+    the window, with the reason breakdown (http_429 / sse_rate_limit /
+    http_other) and how many times it auto-recovered.
+
+    Admin-gated: token ids and per-token limit counts are operational detail.
+    The dashboard / admin session is the intended caller."""
+    try:
+        await get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        rows = await _db(audit.token_rate_limit_summary, since)
+    except Exception:
+        logger.exception("audit rate-limit summary failed")
+        return JSONResponse({"error": "audit store unavailable"}, status_code=503)
+    return JSONResponse({"tokens": rows, "enabled": audit.enabled()})
 
 
 def main():
