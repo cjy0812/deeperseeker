@@ -16,6 +16,8 @@ import aiohttp
 import deepseek_tokenizer
 import wasmtime
 
+import audit
+
 try:
     from playwright.async_api import async_playwright
 except ImportError:
@@ -121,6 +123,12 @@ def init_db():
     }
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
+    # Audit & perf store: same database, created here so the schema exists
+    # before any request can emit an event. Reuses this connection.
+    try:
+        audit.init_audit_db(conn)
+    except Exception:
+        logger.exception("Audit schema init failed (non-fatal)")
     conn.commit()
     conn.close()
     try:
@@ -226,6 +234,12 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
                 path,
                 resp.status,
                 base,
+            )
+            audit.record(
+                "failover",
+                endpoint=path,
+                upstream_status=resp.status,
+                reason="upstream_5xx",
             )
             last_exc = UpstreamError(resp.status, body[:200])
             continue
@@ -599,6 +613,8 @@ def pick_token(exclude=None):
             logger.info(
                 "Token pool: cooldown expired, auto-recovered token(s) %s", recovered
             )
+            for tid in recovered:
+                audit.record("rate_recover", token_id=tid, reason="cooldown_expired")
 
         def _sort_key(entry):
             tid, last_used = entry
@@ -620,7 +636,14 @@ def pick_token(exclude=None):
     return row[0] if row else None
 
 
-def mark_limited(token_id):
+def mark_limited(token_id, reason=None, **audit_fields):
+    """Mark a token RATE_LIMITED and audit the trigger.
+
+    The single funnel for every upstream rate-limit signal, so this is where
+    the `rate_limit` audit event is emitted. `reason` distinguishes WHICH
+    signal fired: http_429 / http_403 / http_401 / sse_rate_limit. Any extra
+    keyword is forwarded to audit.record (upstream_status, session_id, ...).
+    """
     until = time.time() + TOKEN_COOLDOWN_SECONDS
     logger.warning(
         "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
@@ -634,6 +657,7 @@ def mark_limited(token_id):
     )
     conn.commit()
     conn.close()
+    audit.record("rate_limit", token_id=token_id, reason=reason, **audit_fields)
 
 
 def mark_active(token_id):
@@ -721,6 +745,11 @@ def save_session(sig, token_id, session_id, parent_message_id=0):
             prune_sessions()
         except Exception:
             logger.exception("Session pruning failed (non-fatal)")
+        # Audit retention rides the existing prune cadence - no new timer.
+        try:
+            audit.prune_audit()
+        except Exception:
+            logger.exception("Audit pruning failed (non-fatal)")
 
 
 def delete_session(sig):
