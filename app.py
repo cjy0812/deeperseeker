@@ -100,7 +100,35 @@ def _resolve_api_key():
     return generated, True
 
 
-API_KEY, _api_key_generated = _resolve_api_key()
+# Plan 1.4: the key is resolved on first use, never at import. Import-time
+# resolution wrote api_key.txt into the source tree as a side effect of merely
+# importing this module — a bare `pytest` run was enough to do it. The lifespan
+# hook now owns that write. API_KEY is deliberately NOT a module global: it is
+# served by __getattr__ below, so `from app import API_KEY` and app.API_KEY
+# keep working while resolving lazily.
+_api_key_cache = None
+_api_key_generated = False
+
+
+def _ensure_api_key():
+    """Resolve and cache the API key, generating + persisting it on first call.
+
+    Idempotent and cheap after the first call. Every read site goes through
+    here, so nothing depends on the key being ready at import time."""
+    global _api_key_cache, _api_key_generated
+    if _api_key_cache is None:
+        _api_key_cache, _api_key_generated = _resolve_api_key()
+    return _api_key_cache
+
+
+def __getattr__(name):
+    # PEP 562: API_KEY resolves on attribute access instead of at import, which
+    # keeps `from app import API_KEY` (used by callers and tests) working.
+    if name == "API_KEY":
+        return _ensure_api_key()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
@@ -134,14 +162,17 @@ def _log_security_banner():
     quietly shipping an open relay."""
     host = (os.getenv("HOST") or "").strip().lower()
     loopback = host in ("", "127.0.0.1", "localhost", "::1")
+    # Resolved through the accessor, not the module global: API_KEY is served by
+    # __getattr__ (PEP 562), so a bare name here would be an undefined reference.
+    api_key = _ensure_api_key()
     if _api_key_generated:
         logger.warning(
             "SECURITY: DEEPSEEKER_API_KEY was not set — a strong API key was generated for this "
             "instance and saved to api_key.txt next to the database. It is shown ONCE here:\n"
             "  API key: %s",
-            API_KEY,
+            api_key,
         )
-    elif API_KEY.strip().lower() == "dseeker":
+    elif api_key.strip().lower() == "dseeker":
         logger.warning(
             "SECURITY: DEEPSEEKER_API_KEY is the publicly documented default 'dseeker'. "
             "Set a strong key before exposing this service beyond loopback."
@@ -161,7 +192,9 @@ def _log_security_banner():
             )
 
 
-_log_security_banner()
+# The banner is emitted from the lifespan hook, not here: it reports whether the
+# key was generated, which is only known after _ensure_api_key() has run — and
+# that must not happen at import time (plan 1.4).
 
 # The token used for this request, logged as "key: <alias>".
 # Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
@@ -256,6 +289,10 @@ async def _db(fn, *args, **kwargs):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _db(init_db)
+    # Plan 1.4: resolve the key here, not at import. Both the generation (which
+    # writes api_key.txt) and the banner that reports it belong to startup.
+    _ensure_api_key()
+    _log_security_banner()
     _install_key_access_formatter()
     yield
     # Stage 1 minor list: release the shared aiohttp ClientSession so shutdown
@@ -483,7 +520,9 @@ def get_api_key(request: Request):
 
 def check_key(request: Request):
     key = get_api_key(request)
-    return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
+    # Resolved through the accessor: API_KEY is served by __getattr__ (PEP 562)
+    # and must not be read as a bare module global.
+    return secrets.compare_digest(key.encode("utf-8"), _ensure_api_key().encode("utf-8"))
 
 
 def _admin_or_key(request: Request):

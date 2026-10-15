@@ -7,8 +7,10 @@ import mimetypes
 import os
 import random
 import re
+import shutil
 import sqlite3
 import string
+import sys
 import time
 from datetime import UTC, datetime
 
@@ -32,39 +34,91 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 wasm_path = os.path.join(BASE_DIR, "wasm", "deepseek_pow_solver.wasm")
 _session = None
-_db = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "deeperseeker.db")
+# DB_PATH (bare name, no DEEPSEEKER_ prefix) remains the single override.
+# The default used to be the package directory itself, which littered a source
+# checkout with runtime state; everything mutable now lives in data/.
+_db = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "data", "deeperseeker.db")
+
+
+# Runtime artifact directory. audit.py deliberately imports nothing from this
+# module (functions imports audit — importing back would cycle), so it
+# recomputes the same path on its own: change one and you must change the other.
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
 
 def data_dir():
-    """Directory holding the SQLite database (and runtime files stored next to
-    it, e.g. the generated API key). Honors DB_PATH; anchored to the package
-    directory by default so nothing depends on the process CWD."""
+    """Directory holding the SQLite database and the runtime files stored next
+    to it (generated API key, DeepSeek cookie jar). Honors DB_PATH; defaults to
+    the package's data/ subdirectory so a source checkout stays clean."""
     return os.path.dirname(os.path.abspath(_db))
+
+
+def _migrate_legacy_db():
+    """One-shot move of a pre-data/ checkout database into DATA_DIR.
+
+    Runs at import, before anything connects: a source checkout that predates
+    the data/ move keeps its token pool instead of quietly starting empty.
+    An explicit DB_PATH disables it — that caller owns the location.
+    """
+    if os.getenv("DB_PATH"):
+        return
+    old = os.path.join(BASE_DIR, "deeperseeker.db")
+    new = os.path.join(DATA_DIR, "deeperseeker.db")
+    if os.path.exists(new) or not os.path.exists(old):
+        return
+    # WAL sidecars hold committed pages that are not in the main file yet;
+    # moving the main file alone would silently drop the most recent writes.
+    for suffix in ("", "-wal", "-shm"):
+        src, dst = old + suffix, new + suffix
+        if not os.path.exists(src):
+            continue
+        try:
+            try:
+                os.replace(src, dst)
+            except OSError:
+                # EXDEV: data/ may live on another device (bind mount, tmpfs).
+                shutil.move(src, dst)
+        except Exception as e:
+            print(
+                f"deeperseeker: could not move {src} to {dst}: {e} "
+                "(continuing with a fresh database)",
+                file=sys.stderr,
+            )
+            return
+
+
+# The data/ directory must exist before the first sqlite3.connect(): every
+# connection helper used to assume it was already there.
+try:
+    os.makedirs(data_dir(), exist_ok=True)
+except OSError as e:
+    print(f"deeperseeker: could not create {data_dir()}: {e}", file=sys.stderr)
+_migrate_legacy_db()
 
 
 def cookie_file_path():
     """Resolve where the DeepSeek cookie file lives.
 
     Order: DEEPSEEKER_COOKIE_PATH env > the target of a legacy Docker symlink
-    > next to the real DB file (which honors DB_PATH) > the package directory.
+    > next to the real DB file (which honors DB_PATH, so it honors data/).
     Writing goes to the RESOLVED path so os.replace() can never destroy a
     symlink that bridges the file into the persistent data volume.
+
+    The old cwd-guessing branch is gone: where the cookie landed used to depend
+    on the working directory the process happened to be started from.
     """
     p = os.getenv("DEEPSEEKER_COOKIE_PATH")
     if p:
         return p
-    p = os.path.join(BASE_DIR, "aws_cookies_deepseek.json")
+    link = os.path.join(BASE_DIR, "aws_cookies_deepseek.json")
     try:
-        if os.path.islink(p):
-            target = os.path.realpath(p)
+        if os.path.islink(link):
+            target = os.path.realpath(link)
             if target:
                 return target
     except Exception:
         pass
-    d = os.path.dirname(os.path.abspath(_db))
-    if d and os.path.abspath(d) != os.path.abspath(os.getcwd()):
-        return os.path.join(d, "aws_cookies_deepseek.json")
-    return p
+    return os.path.join(data_dir(), "aws_cookies_deepseek.json")
 
 
 try:

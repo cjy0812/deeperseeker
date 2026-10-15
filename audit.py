@@ -33,9 +33,13 @@ import sys
 import time
 
 # Resolved exactly like functions._db so both modules address one database.
-# DB_PATH is honored; the fallback is the package directory.
+# DB_PATH is honored; the fallback is the package's data/ subdirectory.
+# functions.py recomputes these same two paths on its own (it imports this
+# module, so importing back would cycle): change one and you must change the
+# other.
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_DB_PATH = os.getenv("DB_PATH") or os.path.join(_BASE_DIR, "deeperseeker.db")
+_DATA_DIR = os.path.join(_BASE_DIR, "data")
+_DB_PATH = os.getenv("DB_PATH") or os.path.join(_DATA_DIR, "deeperseeker.db")
 
 # Per-request ambient fields (request_id, endpoint, scope, model, ...).
 #

@@ -1,4 +1,5 @@
 aws_cookies_deepseek.json
+aws_cookies_deepseek.json.tmp
 __pycache__/
 deeperseeker.db
 *.db.bak
@@ -10,3 +11,6 @@ deeperseeker.db-shm
 .python-version
 .pytest_cache/
 .ruff_cache
+# Runtime artifacts (DB, API key, cookie jar, audit JSONL) all live here.
+data/
+.claude/plans/
