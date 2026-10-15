@@ -482,6 +482,24 @@ def check_key(request: Request):
     return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
 
 
+def _admin_or_key(request: Request):
+    """True when the caller is a live admin session OR presents the API key.
+
+    Read-only audit endpoints are wanted from two directions: an operator
+    scraping them from the same client that talks to the proxy (API key), and
+    the /audit page rendering them in a browser (admin session cookie). The
+    session check is the same CSRF-origin guard as get_current_admin; it
+    raises HTTPException, so it is folded into a boolean here rather than
+    propagated."""
+    if check_key(request):
+        return True
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return False
+    return True
+
+
 def _upstream_http_code(exc):
     """HTTP status carried by an upstream failure (B6).
 
@@ -2535,12 +2553,13 @@ async def audit_perf(request: Request, window: int = 3600):
     """Perf status: request volume, error rate, latency percentiles and the
     recovery counters over the trailing `window` seconds.
 
-    Gated by the API key (like /health's detail block) rather than the admin
-    session, so an operator can scrape it from the same client that talks to
-    the proxy. Read-only, best-effort: an audit-store failure is a 503, never
+    Gated by EITHER the API key (so an operator can scrape it from the same
+    client that talks to the proxy) OR a live admin session (so the /audit
+    page can render the same roll-up without embedding the API key in the
+    browser). Read-only, best-effort: an audit-store failure is a 503, never
     a 500, since the data is diagnostic."""
-    if not check_key(request):
-        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    if not _admin_or_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
         summary = await _db(audit.perf_summary, window)
     except Exception:
@@ -2559,7 +2578,11 @@ async def audit_rate_limits(request: Request, since: float = None):
     Admin-gated: token ids and per-token limit counts are operational detail.
     The dashboard / admin session is the intended caller."""
     try:
-        await get_current_admin(request)
+        # get_current_admin is synchronous (it returns "admin"): awaiting its
+        # return value raised TypeError, which the HTTPException handler below
+        # could not catch, so the admin-session path was a 500 and only the
+        # API-key path (which this endpoint does not accept) ever worked.
+        get_current_admin(request)
     except HTTPException:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
