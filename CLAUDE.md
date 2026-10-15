@@ -15,16 +15,18 @@ cp .env.example .env               # 首次配置
 uv run deeperseeker                # 启动服务（或：python app.py）
 ```
 
-Lint 与测试——CI 在 Python 3.13 上跑的正是这两条：
+Lint 与测试——CI 在 Python 3.13 上跑的正是这两条。**注意 venv 的布局随平台而异**：Windows 在 `.venv/Scripts/`，POSIX 在 `.venv/bin/`。下面的命令以本机（Windows）为准，POSIX 请把 `.venv/Scripts/<name>.exe` 换成 `.venv/bin/<name>`：
 
 ```bash
-.venv/bin/ruff check             # 静态检查（配置在 pyproject.toml，line-length 88）
-.venv/bin/ruff check --fix       # 自动修复
-.venv/bin/pytest                 # 全量测试
-.venv/bin/pytest tests/test_token_pool.py                       # 单个文件
-.venv/bin/pytest tests/test_token_pool.py::test_cooldown_auto_recovery  # 单个用例
+.venv/Scripts/ruff.exe check     # 静态检查（配置在 pyproject.toml，line-length 88）
+.venv/Scripts/ruff.exe check --fix   # 自动修复
+.venv/Scripts/python.exe -m pytest   # 全量测试
+.venv/Scripts/python.exe -m pytest tests/test_token_pool.py                       # 单个文件
+.venv/Scripts/python.exe -m pytest tests/test_token_pool.py::test_cooldown_auto_recovery  # 单个用例
 python tests/test_token_pool.py  # 每个测试文件也可直接运行
 ```
+
+POSIX 等价写法：`.venv/bin/ruff check` / `.venv/bin/pytest`。用 `python -m pytest` 而不是直接 `pytest`，可以避免踩到 PATH 上另一个 Python 的坑。
 
 测试兼容 pytest，但被写成可独立运行（`python tests/<file>.py`），因此每个文件都自行把仓库根目录插入 `sys.path`。**没有 `conftest.py`**，不要假设它存在；`tmpdir` 一类的 fixture 往往是测试文件内部手写的。
 
@@ -36,13 +38,13 @@ python tests/test_token_pool.py  # 每个测试文件也可直接运行
 
 一个 FastAPI 反向代理，冒充 DeepSeek 网页版聊天客户端，再把它以 OpenAI / Anthropic 兼容 API 的形式暴露出去。客户端说的是 OpenAI/Anthropic 线格式；代理在两种方向上都做转换，并且底层走的是一条**持久化的网页聊天会话**，而不是无状态 API 调用。
 
-整个系统是仓库根目录下的四个扁平模块（没有包目录），外加 `static/`、`templates/`、`wasm/`：
+整个系统是仓库根目录下的五个扁平模块（没有包目录），外加 `static/`、`templates/`、`wasm/`；运行时的 SQLite 库、API key 与 cookie 都落在 `data/`（见下）：
 
 - **`app.py`**（约 2.5K 行）—— FastAPI 接口层。所有 HTTP 路由、两个流式写出器（OpenAI 用 `stream_response`，Anthropic 用 `stream_anthropic_response`）、请求/响应格式转换、dashboard 与管理端鉴权，以及核心编排函数 `handle_chat`。
 - **`functions.py`**（约 2K 行）—— 上游客户端与 SQLite 存储。与 `chat.deepseek.com` 通信，管理 token 池、PoW 挑战求解、cookie 生成、会话持久化、文件上传与 SSE 解析。`StreamToolParser` 和多格式工具调用解析也在这里。
 - **`plugin_helper.py`** —— 提示词构造与上下文策略。规范化/消息签名、历史 token 预算、摘要式滚动（summarize-and-rollover）触发条件、附件描述、文件抽取与上传。上下文窗口行为在这里，不在 `app.py`。
 - **`middleware.py`** —— `RealIPMiddleware`（由 `TRUSTED_PROXIES` 控制的 X-Forwarded-For 解析）、`RequestIDMiddleware`、`RecovererMiddleware`（把未处理异常转成 JSON 错误而不是裸 500）。`RequestIDMiddleware` 还通过 `audit.bind_request()` 把 request_id / endpoint / scope / model 绑到 ContextVar 上。
-- **`audit.py`** —— 审计与性能事件存储。**刻意不 import 项目里任何其他模块**（`functions.py` 要 import 它，反向 import 会成环），自行按 `DB_PATH` 解析出同一个 SQLite 库。写路径 best-effort（`record()` 吞掉所有异常，只留一行 stderr），读路径故意会抛（`/v1/audit/*` 据此返回 503，好让运维分得清「库坏了」和「窗口内无事件」）。
+- **`audit.py`** —— 审计与性能事件存储。**刻意不 import 项目里任何其他模块**（`functions.py` 要 import 它，反向 import 会成环），因此它与 `functions.py` **各自独立地重算同一套 `data/` 路径**（`DB_PATH` 仍是唯一 override）——改动其中一处的路径解析，必须同步改另一处，否则两边会指向不同目录。事件写进按 UTC 天分文件的 JSONL（`data/audit/audit-YYYY-MM-DD.jsonl`），不再走 SQLite 表；启动时会读取遗留的 `audit_events` 表、转写进 JSONL 再 DROP 它。写路径 best-effort（`record()` 吞掉所有异常，只留一行 stderr），读路径故意会抛（`/v1/audit/*` 据此返回 503，好让运维分得清「存储坏了」和「窗口内无事件」）。
 
 ### 请求流程
 

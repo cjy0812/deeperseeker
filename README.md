@@ -95,6 +95,9 @@ cp .env.example .env
 | `DEEPSEEKER_ROLLOVER_SAFETY_TOKENS` | Headroom reserved below the memory limit before summarizing | `24000` |
 | `DEEPSEEKER_MAX_SUMMARY_TOKENS` | Budget for the model-generated handoff summary | `4096` |
 | `DEEPSEEKER_PER_TOOL_RESULT_TOKENS` | Per-result tool-output cap (so one giant output can't eat the budget) | `2000` |
+| `DEEPSEEKER_AUDIT_ENABLED` | Record audit/perf events (anything other than `0`/`false`/`no`/`off` enables it) | `1` (on) |
+| `DEEPSEEKER_AUDIT_RETENTION_DAYS` | Drop audit files older than this many days (`0` disables time-based pruning) | `7` |
+| `DEEPSEEKER_AUDIT_MAX_ROWS` | Cap on retained audit rows across all files | `50000` |
 
 ## Auth Token Setup
 
@@ -128,6 +131,7 @@ cp .env.example .env
 - **Tool Calling & Streaming**: Server-sent events (SSE) streaming with think-tag reassembly across chunk boundaries (no truncation) and multi-format tool-call parsing — DSML XML, `<tool_call>` XML, `<function_call>` blocks, and JSON — into OpenAI/Anthropic tool schemas.
 - **File & Vision Support**: Base64/URL image extraction (with SSRF protection) and document upload streaming. Images and documents are referenced directly via `ref_file_ids` — the vision file-forking step (`fork_file_task`) was removed because `v4.1flash` handles vision natively.
 - **Claude Desktop Compatible**: Rich `/v1/models` capability metadata + the `anthropic/claude-v4.1flash` alias for automatic client discovery.
+- **Audit & Perf Trail**: Every client request, rate-limit hit, cooldown auto-recovery, and upstream failover is recorded as one JSON object per line in `data/audit/audit-YYYY-MM-DD.jsonl` (one file per UTC day, oldest first). The dashboard renders it at `/audit`, with summary endpoints at `/v1/audit/perf` and `/v1/audit/rate-limits`. Retention is controlled by `DEEPSEEKER_AUDIT_ENABLED`, `DEEPSEEKER_AUDIT_RETENTION_DAYS`, and `DEEPSEEKER_AUDIT_MAX_ROWS`.
 - **Hardened Dashboard**: Session TTL, brute-force login lockout (5 attempts → 5 min), CSRF origin check.
 
 ## Pricing (per 1M tokens, as of 2026-09-06)
