@@ -17,6 +17,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import audit  # noqa: E402
 import functions  # noqa: E402
 
 
@@ -25,6 +26,14 @@ def _fresh_pool(tmpdir, tokens):
     functions._db = os.path.join(str(tmpdir), "pool.db")
     if os.path.exists(functions._db):
         os.remove(functions._db)
+    # audit.py resolves its own paths once at import, independently of
+    # functions._db, so mark_limited()'s rate_limit event would otherwise
+    # append to the repo's real data/audit/. Redirect it into the same
+    # throwaway dir; reset the process-wide seq counter so each pool's
+    # ordering starts fresh.
+    audit._DB_PATH = os.path.join(str(tmpdir), "audit.db")
+    audit._AUDIT_DIR = os.path.join(str(tmpdir), "audit")
+    audit._seq_state["next"] = None
     functions._in_flight.clear()
     functions.init_db()
     for alias in tokens:

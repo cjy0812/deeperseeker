@@ -10,6 +10,13 @@ import contextlib
 import json
 import os
 import sys
+import tempfile
+
+# Isolate runtime artifacts: functions.py and audit.py both read DB_PATH once,
+# at import time. Set it before importing any project module, or tests write
+# into the repo's real data/audit/.
+_ISOLATED_DIR = tempfile.mkdtemp(prefix='deeperseeker-test-')
+os.environ['DB_PATH'] = os.path.join(_ISOLATED_DIR, 'deeperseeker.db')
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
