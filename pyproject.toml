@@ -26,12 +26,15 @@ pip_strict = false
 [tool.hatch.build.targets.wheel]
 only-include = [
     "app.py",
+    "audit.py",
     "functions.py",
+    "i18n",
     "middleware.py",
     "plugin_helper.py",
     "static",
     "templates",
     "wasm",
+    "webui.py",
 ]
 
 [build-system]
