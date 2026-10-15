@@ -25,6 +25,7 @@ Design constraints (deliberate, see CLAUDE.md):
 """
 
 import contextlib
+import contextvars
 import json
 import os
 import sqlite3
@@ -35,6 +36,33 @@ import time
 # DB_PATH is honored; the fallback is the package directory.
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DB_PATH = os.getenv("DB_PATH") or os.path.join(_BASE_DIR, "deeperseeker.db")
+
+# Per-request ambient fields (request_id, endpoint, scope, model, ...).
+#
+# The request id is minted in middleware.RequestIDMiddleware and lives on
+# scope["state"]; handle_chat / stream_response never receive the Request, so
+# they cannot read it from there. Binding it to a ContextVar instead lets the
+# middleware set it once and every record()/arecord() call in that task (and in
+# the asyncio.to_thread workers it spawns - to_thread copies the context) pick
+# it up with no plumbing. ContextVar.set() inside an ASGI middleware call is
+# task-local, so concurrent requests never see each other's ids.
+_ctx = contextvars.ContextVar("deeperseeker_audit_ctx", default=None)
+
+
+def bind_request(**fields):
+    """Attach ambient request fields for every audit event in this task.
+
+    Returns the ContextVar token so a caller that must restore the previous
+    value can, though middleware never needs to (each request is its own task).
+    """
+    ctx = dict(_ctx.get() or {})
+    ctx.update({k: v for k, v in fields.items() if v is not None})
+    return _ctx.set(ctx)
+
+
+def current_context():
+    """The ambient request fields bound by bind_request(), or {}."""
+    return dict(_ctx.get() or {})
 
 
 def db_path():
@@ -169,7 +197,16 @@ def record(kind, **fields):
     """
     if not enabled():
         return None
-    row = {col: fields.get(col) for col in _COLUMNS}
+    # Ambient fields bound by bind_request() act as defaults; an explicit
+    # non-None kwarg from the call site always wins. This is what lets the
+    # middleware stamp request_id/endpoint/scope/model once and every event
+    # emitted deeper in the stack inherit them without threading a Request
+    # through handle_chat / stream_response.
+    ambient = _ctx.get() or {}
+    row = {
+        col: fields.get(col) if fields.get(col) is not None else ambient.get(col)
+        for col in _COLUMNS
+    }
     row["ts"] = time.time()
     row["kind"] = str(kind)
     row["detail"] = _coerce_detail(fields.get("detail"))
