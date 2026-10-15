@@ -204,6 +204,52 @@ def test_render_honours_status_code():
     assert resp.status_code == 403
 
 
+# ==============================================================================
+# status_label / dashboard status column
+# ==============================================================================
+#
+# The tokens table stores the raw English enum ("ACTIVE" / "RATE_LIMITED") and
+# the dashboard's CSS class still keys off that raw value -- only the visible
+# text is translated. These tests pin both halves of that contract: the label
+# is localized, and a status the mapping does not know is echoed verbatim
+# rather than rendered as a half-finished "dashboard.status_xxx" key.
+
+
+def _render_status(status, lang):
+    """Render the dashboard with a single token in `status` and return the body."""
+    token = {
+        "id": 1,
+        "alias": None,
+        "token": "abcdefghijklmnopqrstuvwx",
+        "status": status,
+    }
+    resp = webui.render(_Req(query={"lang": lang}), "dashboard.html", tokens=[token])
+    return resp.body.decode("utf-8")
+
+
+def test_status_label_localizes_active():
+    assert "进行中" in _render_status("ACTIVE", "zh")
+    assert "Active" in _render_status("ACTIVE", "en")
+
+
+def test_status_label_localizes_rate_limited():
+    assert "限流中" in _render_status("RATE_LIMITED", "zh")
+    assert "Rate limited" in _render_status("RATE_LIMITED", "en")
+
+
+@pytest.mark.parametrize("lang", ["en", "zh"])
+def test_unknown_status_is_echoed_verbatim(lang):
+    body = _render_status("WEIRD", lang)
+    assert "WEIRD" in body
+    assert "dashboard.status_" not in body
+
+
+def test_status_label_does_not_leak_keys_for_unknown_values():
+    label = webui.status_label("en")
+    assert label("WEIRD") == "WEIRD"
+    assert label("") == ""
+
+
 def main():
     import subprocess
 

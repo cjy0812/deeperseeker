@@ -31,6 +31,8 @@
   "dashboard.th_alias": "Alias",
   "dashboard.th_token": "Token",
   "dashboard.th_status": "Status",
+  "dashboard.status_active": "Active",
+  "dashboard.status_rate_limited": "Rate limited",
   "dashboard.th_actions": "Actions",
   "dashboard.delete": "Delete",
   "dashboard.delete_confirm": "Delete this token?",

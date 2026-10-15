@@ -132,6 +132,31 @@ def client_strings(lang):
     return strings
 
 
+# Token lifecycle states (the raw values stored in the tokens table) -> the
+# locale key that names them in the UI. Kept here, next to the other
+# value->key mappings, so the display translation is auditable in one place and
+# the stored English value never has to change.
+_STATUS_KEYS = {
+    "ACTIVE": "dashboard.status_active",
+    "RATE_LIMITED": "dashboard.status_rate_limited",
+}
+
+
+def status_label(lang):
+    """Return a `status_label(raw_status)` bound to `lang`.
+
+    Maps a stored token status to its translated label. An unknown status is
+    returned verbatim -- the caller gets the raw English value, never a
+    half-rendered ``dashboard.status_xxx`` key.
+    """
+
+    def label(status):
+        key = _STATUS_KEYS.get(status)
+        return i18n.translate(lang, key) if key else status
+
+    return label
+
+
 def render(request, template_name, status_code=200, **context):
     """Render an admin template with i18n wired in.
 
@@ -149,6 +174,7 @@ def render(request, template_name, status_code=200, **context):
     context.setdefault("t", i18n.translator(lang))
     context.setdefault("langs", i18n.LANGS)
     context.setdefault("lang_name", i18n.lang_name)
+    context.setdefault("status_label", status_label(lang))
     context.setdefault("js_i18n", client_strings(lang))
     return templates.TemplateResponse(
         request, template_name, context, status_code=status_code

@@ -31,6 +31,8 @@
   "dashboard.th_alias": "别名",
   "dashboard.th_token": "Token",
   "dashboard.th_status": "状态",
+  "dashboard.status_active": "进行中",
+  "dashboard.status_rate_limited": "限流中",
   "dashboard.th_actions": "操作",
   "dashboard.delete": "删除",
   "dashboard.delete_confirm": "确认删除这个 token？",
