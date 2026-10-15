@@ -177,12 +177,14 @@ def init_db():
     }
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
-    # Audit & perf store: same database, created here so the schema exists
-    # before any request can emit an event. Reuses this connection.
+    # Audit & perf store: no longer a table here. Events live in per-day
+    # JSONL files under data/audit/; this ensures that directory exists and
+    # performs the one-shot migration off the retired audit_events table.
+    # The connection is still passed so the migration can read/drop it.
     try:
         audit.init_audit_db(conn)
     except Exception:
-        logger.exception("Audit schema init failed (non-fatal)")
+        logger.exception("Audit store init failed (non-fatal)")
     conn.commit()
     conn.close()
     try:

@@ -6,9 +6,10 @@ upstream signal rate-limited a token (a real HTTP 429, or a
 token was limited, and which requests rolled over / retried / failed over.
 Three invariants are load-bearing and guarded here:
 
-* record() NEVER raises. Auditing is best-effort - a broken or read-only
-  database must cost audit rows, never a chat response.
-* The rate-limit reason vocabulary stays in sync with the SQL in
+* record() NEVER raises. Auditing is best-effort - an unwritable audit
+  directory must cost audit rows, never a chat response. The readers, by
+  contrast, deliberately raise so /v1/audit/* can answer 503.
+* The rate-limit reason vocabulary stays in sync with the split in
   token_rate_limit_summary(): `http_429` / `sse_rate_limit` / `http_4%`.
   app._rate_limit_reason() is the only producer of those strings, and a
   regression there silently flattens the breakdown to all-http_other.
@@ -19,7 +20,6 @@ Run:  python tests/test_audit.py   (pytest-compatible)
 """
 
 import os
-import sqlite3
 import sys
 import tempfile
 import time
@@ -35,11 +35,28 @@ import audit  # noqa: E402
 
 
 def _fresh_db():
-    """Point audit at a throwaway DB and create the schema there."""
+    """Point the audit store at a throwaway directory.
+
+    _AUDIT_DIR is the module constant every path helper resolves at call
+    time (_file_for_ts / _audit_files / init_audit_db), so patching it is what
+    redirects the writes - patching _DB_PATH alone does not, because
+    _AUDIT_DIR is derived from it once at import.
+
+    _DB_PATH is patched alongside it purely so init_audit_db()'s one-shot
+    legacy-table migration finds no database to read; left unpatched it would
+    open the repo's real data/deeperseeker.db and, if the retired
+    audit_events table were still there, migrate (and drop) real rows.
+    """
     tmpdir = tempfile.mkdtemp()
-    path = os.path.join(tmpdir, "audit.db")
-    patcher = mock.patch.object(audit, "_DB_PATH", path)
+    patcher = mock.patch.multiple(
+        audit,
+        _DB_PATH=os.path.join(tmpdir, "audit.db"),
+        _AUDIT_DIR=os.path.join(tmpdir, "audit"),
+    )
     patcher.start()
+    # The seq counter is process-wide and outlives a single test; seed it from
+    # this empty store so each test's ordering starts from 1.
+    audit._seq_state["next"] = None
     audit.init_audit_db()
     # Ambient context leaks across tests through the ContextVar; reset it.
     audit._ctx.set(None)
@@ -68,7 +85,12 @@ def test_record_then_query_roundtrip():
         assert len(rows) == 1, rows
         row = rows[0]
         assert row["kind"] == "rate_limit"
+        # token_id must round-trip as an int: the JSONL codec is the new
+        # storage boundary, and `== 7` alone would also accept "7" or 7.0.
         assert row["token_id"] == 7
+        assert isinstance(row["token_id"], int) and not isinstance(
+            row["token_id"], bool
+        ), f"token_id lost its int type: {row['token_id']!r}"
         assert row["reason"] == "http_429"
         assert row["endpoint"] == "/v1/messages"
         assert row["ts"] > 0
@@ -96,18 +118,21 @@ def test_query_events_filters_and_order():
 
 def test_record_never_raises_on_broken_db():
     def body():
-        # A directory where the file should be: sqlite3.connect succeeds but
-        # every statement fails. record() must swallow it.
+        # A regular file where the audit directory should be: every append
+        # fails (makedirs / open on a non-directory), so record() must swallow
+        # it and return None.
         #
         # Only the WRITE path is best-effort. The readers deliberately raise:
         # /v1/audit/* turns that into a 503 "audit store unavailable", which
         # an operator must be able to tell apart from "no events in window".
-        bad = tempfile.mkdtemp()
-        with mock.patch.object(audit, "_DB_PATH", bad):
+        bad = os.path.join(tempfile.mkdtemp(), "not-a-dir")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        with mock.patch.object(audit, "_AUDIT_DIR", bad):
             assert audit.record("request", endpoint="/x") is None
             try:
                 audit.query_events()
-            except sqlite3.Error:
+            except OSError:
                 pass
             else:  # pragma: no cover - the raise is the contract
                 raise AssertionError("readers must surface a broken store")
@@ -129,8 +154,13 @@ def test_stream_flag_is_normalized_to_int():
     def body():
         audit.record("request", stream=True)
         audit.record("request", stream=False)
-        assert audit.query_events()[0]["stream"] == 0
-        assert audit.query_events()[1]["stream"] == 1
+        rows = audit.query_events()
+        assert rows[0]["stream"] == 0
+        assert rows[1]["stream"] == 1
+        # The flag is stored as 0/1 and must come back as int - `False == 0`
+        # would let a bool through unnoticed.
+        assert type(rows[0]["stream"]) is int
+        assert type(rows[1]["stream"]) is int
 
     _run_with_db(body)
 
@@ -245,16 +275,22 @@ def test_perf_summary_window_is_clamped():
 
 def test_prune_drops_rows_past_retention():
     def body():
-        audit.record("request")
-        conn = audit.sqlite3.connect(audit._DB_PATH)
-        conn.execute("UPDATE audit_events SET ts = ?", (time.time() - 30 * 86400,))
-        conn.commit()
-        conn.close()
+        audit.record("request", detail="fresh")
+        # Backdate a row by writing it straight to its day's file - the store
+        # is JSONL now, so there is no ts column to UPDATE.
+        old = dict.fromkeys(audit._COLUMNS)
+        old["ts"] = time.time() - 30 * 86400
+        old["kind"] = "request"
+        old["detail"] = "stale"
+        old["seq"] = 2
+        audit._append(old)
 
         with mock.patch.dict(os.environ, {"DEEPSEEKER_AUDIT_RETENTION_DAYS": "7"}):
             deleted = audit.prune_audit()
         assert deleted == 1, deleted
-        assert audit.query_events() == []
+        # Exactly the fresh row survives - the stale one is gone, not merely
+        # hidden from the query.
+        assert [r["detail"] for r in audit.query_events()] == ["fresh"]
 
     _run_with_db(body)
 
@@ -279,7 +315,10 @@ def test_prune_enforces_row_cap_oldest_first():
 
 def test_prune_never_raises():
     def body():
-        with mock.patch.object(audit, "_DB_PATH", tempfile.mkdtemp()):
+        bad = os.path.join(tempfile.mkdtemp(), "not-a-dir")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        with mock.patch.object(audit, "_AUDIT_DIR", bad):
             assert audit.prune_audit() == 0
 
     _run_with_db(body)

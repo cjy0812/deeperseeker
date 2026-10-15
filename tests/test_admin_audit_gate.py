@@ -32,15 +32,24 @@ import audit  # noqa: E402
 
 
 class _AuditDb:
-    """Point the audit store at a throwaway SQLite file for the test body."""
+    """Point the audit store at a throwaway directory for the test body.
+
+    _AUDIT_DIR is the constant the path helpers resolve at call time, and it
+    is derived from _DB_PATH once at import - patching _DB_PATH alone would
+    leave the endpoints reading the repo's real data/audit/.
+    """
 
     def __enter__(self):
         self._tmpdir = tempfile.mkdtemp()
-        self._patch = mock.patch.object(
-            audit, "_DB_PATH", os.path.join(self._tmpdir, "audit.db")
+        self._patch = mock.patch.multiple(
+            audit,
+            _DB_PATH=os.path.join(self._tmpdir, "audit.db"),
+            _AUDIT_DIR=os.path.join(self._tmpdir, "audit"),
         )
         self._patch.start()
+        audit._seq_state["next"] = None
         audit.init_audit_db()
+        audit._ctx.set(None)
         return self
 
     def __exit__(self, *exc):
@@ -71,8 +80,12 @@ def test_rate_limits_admin_session_is_not_a_500():
 
 
 def test_rate_limits_without_session_is_401():
+    # _AuditDb only redirects the store - the request still runs the full
+    # middleware stack, whose per-exchange audit hook would otherwise append
+    # this 401 into the repo's real data/audit/.
     client = TestClient(app_module.app)
-    r = client.get("/v1/audit/rate-limits")
+    with _AuditDb():
+        r = client.get("/v1/audit/rate-limits")
     assert r.status_code == 401, (r.status_code, r.text)
 
 
@@ -90,7 +103,8 @@ def test_perf_accepts_admin_session():
 
 def test_perf_still_rejects_strangers():
     client = TestClient(app_module.app)
-    r = client.get("/v1/audit/perf")
+    with _AuditDb():
+        r = client.get("/v1/audit/perf")
     assert r.status_code == 401, (r.status_code, r.text)
 
 
