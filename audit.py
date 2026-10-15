@@ -158,7 +158,7 @@ def _warn(msg):
     """Last-resort visibility for audit failures: one stderr line, no logging
     setup (this module must not depend on the app's logging configuration)."""
     with contextlib.suppress(Exception):
-        sys.stderr.write("deeperseeker.audit: %s\n" % (msg,))
+        sys.stderr.write(f"deeperseeker.audit: {msg}\n")
 
 
 def _coerce_detail(value):
@@ -224,13 +224,13 @@ def record(kind, **fields):
         cols = ", ".join(_COLUMNS)
         placeholders = ", ".join("?" for _ in _COLUMNS)
         cur = conn.execute(
-            "INSERT INTO audit_events (%s) VALUES (%s)" % (cols, placeholders),
+            f"INSERT INTO audit_events ({cols}) VALUES ({placeholders})",
             tuple(row[col] for col in _COLUMNS),
         )
         conn.commit()
         return cur.lastrowid
     except Exception as e:  # noqa: BLE001 - auditing must never break a request
-        _warn("record(%s) failed: %s" % (kind, e))
+        _warn(f"record({kind}) failed: {e}")
         return None
     finally:
         if conn is not None:
@@ -279,7 +279,7 @@ def query_events(kind=None, token_id=None, since=None, limit=100):
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT * FROM audit_events%s ORDER BY id DESC LIMIT ?" % clause,
+            f"SELECT * FROM audit_events{clause} ORDER BY id DESC LIMIT ?",
             (*args, limit),
         ).fetchall()
     finally:
@@ -456,7 +456,7 @@ def prune_audit():
                 ).rowcount
         conn.commit()
     except Exception as e:  # noqa: BLE001 - pruning is opportunistic
-        _warn("prune failed: %s" % (e,))
+        _warn(f"prune failed: {e}")
         return deleted
     finally:
         if conn is not None:
