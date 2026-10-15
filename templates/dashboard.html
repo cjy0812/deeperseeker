@@ -1,52 +1,55 @@
 {% extends "base.html" %}
-{% block title %}Dashboard - DeeperSeeker{% endblock %}
+{% block title %}{{ t('dashboard.title') }} - DeeperSeeker{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
+<h1>{{ t('dashboard.heading') }}</h1>
 
 <section>
-    <h2>Add Auth Token</h2>
+    <h2>{{ t('dashboard.add_token') }}</h2>
+    {# The step strings carry inline markup and come from our own locale
+       files, never from user input, so |safe is what makes the <strong>/<a>
+       render. Do NOT reuse |safe on anything request-derived. #}
     <div class="steps">
-        <p><strong>Steps:</strong></p>
+        <p><strong>{{ t('dashboard.steps') }}</strong></p>
         <ol>
-            <li>Open <strong>incognito/private</strong> window</li>
-            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
-            <li>Open DevTools (F12) → Console → paste:</li>
+            <li>{{ t('dashboard.step1')|safe }}</li>
+            <li>{{ t('dashboard.step2')|safe }}</li>
+            <li>{{ t('dashboard.step3') }}</li>
         </ol>
         <code>JSON.parse(localStorage.getItem("userToken")).value</code>
         <ol start="4">
-            <li>Copy the token and paste below</li>
-            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
-            <li><strong>Close the incognito window</strong> to preserve the login</li>
+            <li>{{ t('dashboard.step4') }}</li>
+            <li>{{ t('dashboard.step5')|safe }}</li>
+            <li>{{ t('dashboard.step6')|safe }}</li>
         </ol>
     </div>
     <div class="warning">
-        If you logout from DeepSeek in browser, this token stops working.
+        {{ t('dashboard.token_warning') }}
     </div>
     <form method="post" action="/tokens/add">
-        <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" placeholder="Paste auth token here (no quotes)" style="width:400px">
-        <button type="submit">Add Token</button>
+        <input type="text" name="alias" placeholder="{{ t('dashboard.alias_placeholder') }}" class="input-alias">
+        <input type="text" name="auth_token" placeholder="{{ t('dashboard.token_placeholder') }}" class="input-token">
+        <button type="submit">{{ t('dashboard.add_button') }}</button>
     </form>
 </section>
 
 <section>
-    <h2>Tokens ({{ tokens|length }})</h2>
+    <h2>{{ t('dashboard.tokens', n=tokens|length) }}</h2>
     {% if tokens %}
     <table>
         <thead>
             <tr>
-                <th>ID</th>
-                <th>Alias</th>
-                <th>Token</th>
-                <th>Status</th>
-                <th>Actions</th>
+                <th>{{ t('dashboard.th_id') }}</th>
+                <th>{{ t('dashboard.th_alias') }}</th>
+                <th>{{ t('dashboard.th_token') }}</th>
+                <th>{{ t('dashboard.th_status') }}</th>
+                <th>{{ t('dashboard.th_actions') }}</th>
             </tr>
         </thead>
         <tbody>
             {% for tok in tokens %}
             <tr>
                 <td>{{ tok['id'] }}</td>
-                <td>{{ tok['alias'] or '—' }}</td>
+                <td>{{ tok['alias'] or t('common.none') }}</td>
                 <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
                 <td>
                     <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
@@ -54,9 +57,13 @@
                     </span>
                 </td>
                 <td>
-                    <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
-                          onsubmit="return confirm('Delete?')">
-                        <button type="submit" class="btn-sm btn-danger">Delete</button>
+                    {# The confirm text goes through a data attribute, not into a
+                       JS string literal: an apostrophe in a translation would
+                       otherwise break out of the quote and kill the handler. #}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/delete" class="inline-form"
+                          data-confirm="{{ t('dashboard.delete_confirm') }}"
+                          onsubmit="return confirm(this.dataset.confirm)">
+                        <button type="submit" class="btn-sm btn-danger">{{ t('dashboard.delete') }}</button>
                     </form>
                 </td>
             </tr>
@@ -64,14 +71,14 @@
         </tbody>
     </table>
     {% else %}
-    <p>No tokens yet.</p>
+    <p>{{ t('dashboard.no_tokens') }}</p>
     {% endif %}
 </section>
 
 <section>
-    <h2>API</h2>
-    <p>OpenAI: <code>http://localhost:4000/v1</code></p>
-    <p>Anthropic: <code>http://localhost:4000</code></p>
-    <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
+    <h2>{{ t('dashboard.api') }}</h2>
+    <p>{{ t('dashboard.api_openai') }} <code>http://localhost:4000/v1</code></p>
+    <p>{{ t('dashboard.api_anthropic') }} <code>http://localhost:4000</code></p>
+    <p>{{ t('dashboard.api_model') }} <code>v4.1flash</code></p>
 </section>
 {% endblock %}

@@ -1,17 +1,17 @@
 {% extends "base.html" %}
-{% block title %}Login - DeeperSeeker{% endblock %}
+{% block title %}{{ t('login.title') }} - DeeperSeeker{% endblock %}
 {% block content %}
-<h1>Login</h1>
+<h1>{{ t('login.heading') }}</h1>
 {% if error %}
-<p style="color:red;">{{ error }}</p>
+<p class="form-error">{{ error }}</p>
 {% endif %}
 <form method="post" action="/login">
-    <div style="margin-bottom:10px;">
-        <input type="text" name="username" placeholder="Username" required style="width:300px;">
+    <div class="field">
+        <input type="text" name="username" placeholder="{{ t('login.username') }}" required>
     </div>
-    <div style="margin-bottom:10px;">
-        <input type="password" name="password" placeholder="Password" required style="width:300px;">
+    <div class="field">
+        <input type="password" name="password" placeholder="{{ t('login.password') }}" required>
     </div>
-    <button type="submit">Login</button>
+    <button type="submit">{{ t('login.submit') }}</button>
 </form>
 {% endblock %}

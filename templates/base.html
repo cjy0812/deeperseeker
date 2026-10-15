@@ -1,18 +1,32 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ lang }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}DeeperSeeker{% endblock %}</title>
     <link rel="stylesheet" href="/static/style.css">
+    {% block head %}{% endblock %}
 </head>
 <body>
     <nav>
-        <a href="/">Dashboard</a>
+        <a href="/">{{ t('nav.dashboard') }}</a>
         <span class="sep">|</span>
-        <a href="/logout">Logout</a>
+        <a href="/audit">{{ t('nav.audit') }}</a>
+        <span class="sep">|</span>
+        <a href="/logout">{{ t('nav.logout') }}</a>
         <span class="sep">|</span>
         <span class="brand">DeeperSeeker</span>
+        <span class="lang-switch">
+            {% for code in langs %}
+                {% if code == lang %}
+                    <strong>{{ lang_name(code) }}</strong>
+                {% else %}
+                    {# `next` is the current path+query so switching keeps the page. #}
+                    <a href="/lang/{{ code }}?next={{ (request.url.path ~ ('?' ~ request.url.query if request.url.query else '')) | urlencode }}">{{ lang_name(code) }}</a>
+                {% endif %}
+                {% if not loop.last %}<span class="sep">/</span>{% endif %}
+            {% endfor %}
+        </span>
     </nav>
     <main>
         {% block content %}{% endblock %}
