@@ -1,0 +1,118 @@
+/* Audit console styles.
+ *
+ * Loaded by audit.html on top of style.css, which stays the shared base. Page-
+ * specific rules live here so the base sheet does not accumulate one-off
+ * selectors for every screen added later. */
+
+.toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}
+
+.toolbar select,
+.toolbar button {
+    margin-bottom: 0;
+}
+
+.toolbar .checkbox {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: #8b949e;
+    font-size: 0.9em;
+}
+
+/* --- metric cards ------------------------------------------------------- */
+
+.cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+}
+
+.card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 10px 12px;
+}
+
+.card-label {
+    color: #8b949e;
+    font-size: 0.78em;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.card-value {
+    color: #f0f6fc;
+    font-size: 1.3em;
+    font-variant-numeric: tabular-nums;
+}
+
+/* --- key/value panels --------------------------------------------------- */
+
+.perf-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px;
+}
+
+.perf-grid h3 {
+    margin-bottom: 6px;
+    color: #8b949e;
+    font-size: 0.9em;
+    font-weight: 600;
+}
+
+.kv {
+    list-style: none;
+}
+
+.kv li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 3px 0;
+    border-bottom: 1px solid #21262d;
+    font-size: 0.9em;
+}
+
+.kv li:last-child {
+    border-bottom: none;
+}
+
+.kv li.empty {
+    justify-content: flex-start;
+    color: #8b949e;
+}
+
+.kv-key {
+    color: #8b949e;
+}
+
+.kv-value {
+    color: #c9d1d9;
+    font-variant-numeric: tabular-nums;
+}
+
+/* --- rate-limit table --------------------------------------------------- */
+
+#rl-body td {
+    font-variant-numeric: tabular-nums;
+}
+
+/* The "store unavailable" notice must not read as the amber advisory the
+   base .warning class is styled for. */
+#notice.error {
+    background: #da363322;
+    border-color: #da3633;
+    color: #f85149;
+}

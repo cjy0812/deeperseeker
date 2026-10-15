@@ -21,10 +21,11 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from uvicorn.logging import AccessFormatter
 
 import audit
+import i18n
+import webui
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # B12 (Stage 1 audit): the global os.chdir(BASE_DIR) is gone — every relative
@@ -263,7 +264,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="DeeperSeeker", lifespan=lifespan)
-templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+# The Jinja environment is owned by webui (which every admin page renders
+# through). Re-exported here so the token-add/delete routes keep working and
+# there is exactly one template loader in the process.
+templates = webui.templates
 app.mount(
     "/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static"
 )
@@ -2437,7 +2441,7 @@ async def list_models(request: Request):
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    return templates.TemplateResponse(request, "login.html", {"error": None})
+    return webui.render(request, "login.html", error=None)
 
 
 def _prune_admin_sessions():
@@ -2456,8 +2460,8 @@ async def login_submit(request: Request):
     password = form.get("password", "")
     _prune_admin_sessions()
     if time.time() < _login_fails["locked_until"]:
-        return templates.TemplateResponse(
-            request, "login.html", {"error": "Too many attempts. Try again later."}
+        return webui.render(
+            request, "login.html", error=webui.translate(request, "login.too_many_attempts")
         )
     if secrets.compare_digest(
         username.encode("utf-8"), ADMIN_USER.encode("utf-8")
@@ -2474,8 +2478,8 @@ async def login_submit(request: Request):
     if _login_fails["count"] >= 5:
         _login_fails["locked_until"] = time.time() + 300
         _login_fails["count"] = 0
-    return templates.TemplateResponse(
-        request, "login.html", {"error": "Invalid username or password"}
+    return webui.render(
+        request, "login.html", error=webui.translate(request, "login.failed")
     )
 
 
@@ -2488,22 +2492,79 @@ async def logout(request: Request):
     return resp
 
 
+def _safe_next(raw, default="/dashboard"):
+    """Sanitize a `next` redirect target: site-relative paths only.
+
+    This is the open-redirect boundary. A caller-supplied `next` that is
+    echoed into a Location/meta-refresh must not be able to send a logged-in
+    admin to another origin, so anything with a scheme, a netloc, or a
+    protocol-relative prefix (`//evil.com`) is discarded in favor of the
+    default. Backslashes are rejected too: browsers normalize `\/\/evil.com`
+    to a protocol-relative URL, which smuggles the same attack past a naive
+    startswith("/") check.
+    """
+    if not raw:
+        return default
+    raw = raw.strip()
+    if not raw.startswith("/"):
+        return default
+    if raw.startswith("//") or raw.startswith("/\\") or "\\" in raw:
+        return default
+    # A scheme-ish prefix after the leading slash (e.g. "/http://x") is not a
+    # same-origin path; urlparse on the whole thing catches /.. escapes too.
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        return default
+    return raw
+
+
+@app.get("/lang/{code}")
+async def set_language(code: str, request: Request, next: str = "/dashboard"):
+    """Persist the UI language in a cookie and bounce back to `next`.
+
+    The code is validated against i18n.LANGS rather than trusted: an
+    unvalidated value would otherwise reach the locale loader's file path.
+    """
+    if code not in i18n.LANGS:
+        return JSONResponse({"error": "unsupported language"}, status_code=400)
+    target = _safe_next(next)
+    resp = HTMLResponse(
+        f"<meta http-equiv='refresh' content='0;url={target}'>"
+    )
+    # 1 year, lax: the switcher is a GET navigation, so a strict cookie would
+    # be dropped on the return trip from an external referrer.
+    resp.set_cookie(
+        i18n.LANG_COOKIE, code, max_age=365 * 24 * 3600, httponly=True, samesite="lax"
+    )
+    return resp
+
+
+@app.get("/audit")
+async def audit_page(request: Request):
+    """The audit console: perf roll-up + token rate-limit detail.
+
+    Admin-gated like the dashboard; the page itself is a shell — audit.js
+    fetches the JSON endpoints."""
+    denied = webui.gate(request, get_current_admin)
+    if denied:
+        return denied
+    return webui.render(request, "audit.html")
+
+
 @app.get("/dashboard")
 async def dashboard(request: Request):
-    try:
-        get_current_admin(request)
-    except HTTPException:
-        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    denied = webui.gate(request, get_current_admin)
+    if denied:
+        return denied
     tokens = await _db(get_tokens)
-    return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
+    return webui.render(request, "dashboard.html", tokens=tokens)
 
 
 @app.post("/tokens/add")
 async def tokens_add(request: Request):
-    try:
-        get_current_admin(request)
-    except HTTPException:
-        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    denied = webui.gate(request, get_current_admin)
+    if denied:
+        return denied
     form = await request.form()
     auth_token = form.get("auth_token", "").strip().strip("'\"")
     alias = form.get("alias", "").strip() or None
@@ -2514,10 +2575,9 @@ async def tokens_add(request: Request):
 
 @app.post("/tokens/{token_id}/delete")
 async def tokens_delete(token_id: int, request: Request):
-    try:
-        get_current_admin(request)
-    except HTTPException:
-        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    denied = webui.gate(request, get_current_admin)
+    if denied:
+        return denied
     await _db(delete_token, token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 

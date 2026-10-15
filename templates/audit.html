@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}{{ t('audit.title') }} - DeeperSeeker{% endblock %}
+{% block head %}
+{# Audit-only styles ship in their own sheet so style.css stays the shared
+   base instead of turning into a dumping ground. #}
+<link rel="stylesheet" href="/static/audit.css">
+{% endblock %}
+{% block content %}
+<h1>{{ t('audit.heading') }}</h1>
+
+<div class="toolbar">
+    <label for="window">{{ t('audit.window') }}</label>
+    <select id="window">
+        <option value="3600">{{ t('audit.window_1h') }}</option>
+        <option value="86400" selected>{{ t('audit.window_24h') }}</option>
+        <option value="604800">{{ t('audit.window_7d') }}</option>
+    </select>
+    <button type="button" id="refresh">{{ t('audit.refresh') }}</button>
+    <label class="checkbox">
+        <input type="checkbox" id="auto"> {{ t('audit.auto_refresh') }}
+    </label>
+    <span id="status" class="hint" role="status"></span>
+</div>
+
+{# Toggled by audit.js; the text is resolved at load time, never built in JS. #}
+<p id="notice" class="warning" hidden></p>
+
+<section>
+    <h2>{{ t('audit.perf_heading') }}</h2>
+    {# Labels are rendered server-side; audit.js only fills the values, which
+       is why it needs no per-metric translation of its own. #}
+    <div class="cards">
+        <div class="card">
+            <span class="card-label">{{ t('audit.metric_requests') }}</span>
+            <span class="card-value" data-metric="requests">…</span>
+        </div>
+        <div class="card">
+            <span class="card-label">{{ t('audit.metric_error_rate') }}</span>
+            <span class="card-value" data-metric="error_rate">…</span>
+        </div>
+        <div class="card">
+            <span class="card-label">{{ t('audit.metric_p50') }}</span>
+            <span class="card-value" data-metric="p50">…</span>
+        </div>
+        <div class="card">
+            <span class="card-label">{{ t('audit.metric_p95') }}</span>
+            <span class="card-value" data-metric="p95">…</span>
+        </div>
+        <div class="card">
+            <span class="card-label">{{ t('audit.metric_p99') }}</span>
+            <span class="card-value" data-metric="p99">…</span>
+        </div>
+        <div class="card">
+            <span class="card-label">{{ t('audit.metric_tokens_limited') }}</span>
+            <span class="card-value" data-metric="tokens_limited">…</span>
+        </div>
+    </div>
+
+    <div class="perf-grid">
+        <div>
+            <h3>{{ t('audit.perf_errors') }}</h3>
+            <ul class="kv" id="reasons"></ul>
+        </div>
+        <div>
+            <h3>{{ t('audit.perf_recoveries') }}</h3>
+            <ul class="kv" id="counters"></ul>
+        </div>
+        <div>
+            <h3>{{ t('audit.perf_rollovers') }}</h3>
+            <ul class="kv" id="rollovers"></ul>
+        </div>
+    </div>
+</section>
+
+<section>
+    <h2>{{ t('audit.rl_heading') }}</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>{{ t('audit.rl_th_token') }}</th>
+                <th>{{ t('audit.rl_th_count') }}</th>
+                <th>{{ t('audit.rl_th_http429') }}</th>
+                <th>{{ t('audit.rl_th_sse') }}</th>
+                <th>{{ t('audit.rl_th_other') }}</th>
+                <th>{{ t('audit.rl_th_recovered') }}</th>
+                <th>{{ t('audit.rl_th_last') }}</th>
+                <th>{{ t('audit.rl_th_reason') }}</th>
+            </tr>
+        </thead>
+        <tbody id="rl-body"></tbody>
+    </table>
+    <p id="rl-empty" class="hint" hidden>{{ t('audit.rl_empty') }}</p>
+</section>
+
+{# Every string audit.js writes into the DOM comes from this blob, so a page
+   can never render half in one language and half in another. The table is
+   built by webui.client_strings, not here: it is defined next to the script
+   it feeds so the two shapes can be compared in one place. Shipped as JSON
+   (not JS string literals) so a quote or apostrophe inside a translation
+   cannot break out of the script. #}
+<script type="application/json" id="i18n">{{ js_i18n | tojson }}</script>
+<script src="/static/js/audit.js" defer></script>
+{% endblock %}
