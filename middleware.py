@@ -27,6 +27,8 @@ import uuid
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+import audit
+
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -162,6 +164,15 @@ class RequestIDMiddleware:
             inbound if _REQUEST_ID_RE.match(inbound or "") else uuid.uuid4().hex
         )
         state["request_id"] = request_id
+        # Ambient audit fields for everything this request emits. The route
+        # handlers below add model/stream/scope via bind_request() and the
+        # store helpers inherit the lot through audit.record()'s ContextVar -
+        # no Request object has to be threaded into handle_chat or the
+        # stream writers, which never receive one.
+        audit.bind_request(
+            request_id=request_id,
+            endpoint=scope.get("path"),
+        )
 
         started = time.perf_counter()
         status_holder = {"status": None}
@@ -188,6 +199,18 @@ class RequestIDMiddleware:
                 else "ERR",
                 duration_ms,
                 state.get("real_ip", "-"),
+            )
+            # One 'request' event per HTTP exchange: this is the latency/error
+            # source perf_summary() aggregates. The status is the status the
+            # CLIENT saw (a response that never started stays None and counts
+            # as a failure, per that view's SQL). stream/model/scope come from
+            # the ambient fields the route bound, so a stream is tagged by the
+            # handler that decided to stream rather than guessed here.
+            await audit.arecord(
+                "request",
+                latency_ms=duration_ms,
+                upstream_status=status_holder["status"],
+                detail="{} {}".format(scope.get("method", "-"), scope.get("path", "-")),
             )
 
 
