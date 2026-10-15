@@ -314,9 +314,16 @@ class UpstreamError(Exception):
     mapping whenever a wording changed. Callers read .status directly; str()
     keeps the familiar 'HTTP <status>: <body>' shape for logs."""
 
-    def __init__(self, status, body=""):
+    def __init__(self, status, body="", origin="http"):
         self.status = int(status)
         self.body = str(body)
+        # Which signal produced this failure: "http" (the completion POST came
+        # back non-200) or "sse" (an error event inside an otherwise-200 SSE
+        # body). The rate-limit audit keys its reason breakdown on this
+        # distinction: an HTTP 429 and a `rate_limit_reached` event both reach
+        # app.py as status 429, so the origin is the only thing that can tell
+        # them apart when the token is marked RATE_LIMITED.
+        self.origin = origin
         super().__init__(f"HTTP {self.status}: {self.body}")
 
 
@@ -1698,7 +1705,7 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
             "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        raise UpstreamError(code, msg)
+        raise UpstreamError(code, msg, origin="sse")
     if _sse_context_limit_hint(recent_lines, parsed_events):
         msg = _EMPTY_SSE_CONTEXT
     else:
@@ -1718,10 +1725,10 @@ def _raise_sse_error_event(data, recent_lines):
             "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        raise UpstreamError(429, content)
+        raise UpstreamError(429, content, origin="sse")
     if finish in ("permission_denied", "forbidden"):
-        raise UpstreamError(403, content)
-    raise UpstreamError(502, content)
+        raise UpstreamError(403, content, origin="sse")
+    raise UpstreamError(502, content, origin="sse")
 
 
 async def send_message(
