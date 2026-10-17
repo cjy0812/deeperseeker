@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 路径规范（硬性）
+
+**禁止在源码、脚本、配置、测试、文档中写入绝对路径。** 仓库可能被移动、克隆到任意位置，绝对路径必然失效。
+
+- 定位仓库内文件：一律用 `os.path.dirname(os.path.abspath(__file__))` 派生的 `BASE_DIR` / `Path(__file__).parent`，再 `os.path.join` 拼接。
+- 定位数据/运行时目录：从 `DB_PATH` 环境变量或 `BASE_DIR` 派生，不要写死。
+- 文档与示例中引用路径：用仓库相对的写法（`tests/test_token_pool.py`），不要写盘符前缀或家目录前缀。
+- 测试里需要临时目录：用 `tempfile.mkdtemp()` / `tmp_path`，不要写死路径。
+- 唯一例外是容器内部路径（Dockerfile 的 `/app`、`/var/lib/apt/lists/*`），因为它们相对于镜像根而不是宿主。
+
+发现绝对路径属于 bug，不是风格问题——editable 安装的 `.pth` 曾把旧仓库绝对路径烤进 venv，导致仓库搬家后静默加载旧代码。
+
 ## 提交规范
 
 **每完成一项修改——bug 修复、新功能、重构、文档更新——都必须先提交到 git 再继续下一项。** 不要把不相关的改动塞进同一个提交，也不要在回合结束时留下未提交的完成工作。提交信息沿用现有风格（简短祈使句主题，例如 `Add ruff checking`、`Fix ci badge typo in readme`）。只有在被明确要求时才 push。
