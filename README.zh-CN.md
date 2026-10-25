@@ -68,7 +68,7 @@ cp .env.example .env
 
 ### 方式一——预构建镜像（ghcr.io，amd64 + arm64，推荐）
 
-镜像**只由 CI 构建**（`.github/workflows/release.yml`）——不在本地构建，也不手动构建。版本只有一个来源：`pyproject.toml`（当前为 `version = "6.0"`）。发布流程：改动该字段，推送对应的 `v<版本>` 标签（此处即 `v6.0`）——若标签与 `pyproject.toml` 不一致，工作流会拒绝构建，一致则发布多架构（amd64 + arm64）镜像。拉取即用，无需克隆仓库：
+镜像**只由 CI 构建**（`.github/workflows/release.yml`）——不在本地构建，也不手动构建。版本只有一个来源：`pyproject.toml`（当前为 `version = "7.0"`）。发布流程：改动该字段，推送对应的 `v<版本>` 标签（此处即 `v7.0`）——若标签与 `pyproject.toml` 不一致，工作流会拒绝构建，一致则发布多架构（amd64 + arm64）镜像。拉取即用，无需克隆仓库：
 
 ```bash
 export DEEPSEEKER_ADMIN_PASSWORD='设置一个真实密码'   # P0-8 拒绝在对外暴露时使用 admin/admin
@@ -80,12 +80,12 @@ docker run -d --name deeperseeker -p 4000:4000 \
 更推荐固定到你验证过的 digest，而不是跟随可变标签：
 
 ```bash
-docker pull ghcr.io/amancode22/deeperseeker:6.0 \
-  && docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/amancode22/deeperseeker:6.0
+docker pull ghcr.io/amancode22/deeperseeker:7.0 \
+  && docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/amancode22/deeperseeker:7.0
 # 然后运行 ghcr.io/amancode22/deeperseeker@sha256:<上面输出的digest>
 ```
 
-标签：`pyproject.toml` 里的完整版本（如 `6.0`）、主版本线（如 `6`）和 `latest`——三者都源自同一个字段，镜像标签永远不会和包版本对不上。同样的用法适用于 `podman pull` / `podman run`。
+标签：`pyproject.toml` 里的完整版本（如 `7.0`）、主版本线（如 `7`）和 `latest`——三者都源自同一个字段，镜像标签永远不会和包版本对不上。同样的用法适用于 `podman pull` / `podman run`。
 
 ### 方式二——Docker Compose
 
@@ -238,11 +238,27 @@ API 响应里的 `cost` 就用这套统一费率。
 
 ## 项目文档
 
+- [docs/ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md)——请求生命周期、模块地图、令牌池状态机、流式与截断规则。[English](docs/ARCHITECTURE.md)
+- [docs/API.zh-CN.md](docs/API.zh-CN.md)——逐端点的鉴权、请求字段与响应形状。[English](docs/API.md)
 - [Claude Desktop 配置指南](CLAUDE_DESKTOP_SETUP.md)——几分钟把 Claude Desktop 接上 DeeperSeeker。
 - [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md)——哪些客户端测过、何时、结果如何。
 - [SECURITY.md](SECURITY.md)——安全问题如何上报。
 - [CONTRIBUTING.md](CONTRIBUTING.md)——补丁的分支/测试/合并仪式。
 - [CHANGELOG.md](CHANGELOG.md)——逐版本变更记录。
+
+## Star 历史
+
+<a href="https://www.star-history.com/?repos=amancode22%2Fdeeperseeker&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=amancode22/deeperseeker&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=amancode22/deeperseeker&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=amancode22/deeperseeker&type=date&legend=top-left" />
+ </picture>
+</a>
+
+## 贡献者
+
+[![Contributors](https://contrib.rocks/image?repo=amancode22/deeperseeker)](https://github.com/amancode22/deeperseeker/graphs/contributors)
 
 ## 免责声明
 

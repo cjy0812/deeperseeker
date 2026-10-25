@@ -82,7 +82,7 @@ Set at minimum `DEEPSEEKER_ADMIN_PASSWORD` in that file — [Security defaults](
 
 ### Option 1 — Prebuilt image (ghcr.io, amd64 + arm64) — recommended
 
-Images are **built only by CI** (`.github/workflows/release.yml`) — never locally, never by hand. The version has one source: `pyproject.toml` (`version = "6.0"` today). A release is: bump that field, push the matching `v<version>` tag (here `v6.0`) — the workflow refuses to build if the tag and `pyproject.toml` disagree, then publishes a multi-arch (amd64 + arm64) image. Pull-and-run, no repo clone needed:
+Images are **built only by CI** (`.github/workflows/release.yml`) — never locally, never by hand. The version has one source: `pyproject.toml` (`version = "7.0"` today). A release is: bump that field, push the matching `v<version>` tag (here `v7.0`) — the workflow refuses to build if the tag and `pyproject.toml` disagree, then publishes a multi-arch (amd64 + arm64) image. Pull-and-run, no repo clone needed:
 
 ```bash
 export DEEPSEEKER_ADMIN_PASSWORD='pick-a-real-password'   # P0-8 refuses admin/admin on exposed binds
@@ -94,19 +94,19 @@ docker run -d --name deeperseeker -p 4000:4000 \
 Prefer pinning the digest you verified over a moving tag:
 
 ```bash
-docker pull ghcr.io/amancode22/deeperseeker:6.0 \
-  && docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/amancode22/deeperseeker:6.0
+docker pull ghcr.io/amancode22/deeperseeker:7.0 \
+  && docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/amancode22/deeperseeker:7.0
 # then run ghcr.io/amancode22/deeperseeker@sha256:<digest-of-that-output>
 ```
 
-Tags: the full version from `pyproject.toml` (e.g. `6.0`), the major line (e.g. `6`), and `latest` — all three always come from that one field, so an image tag can never disagree with the package version. The same directory works with `podman pull`/`podman run` unchanged.
+Tags: the full version from `pyproject.toml` (e.g. `7.0`), the major line (e.g. `7`), and `latest` — all three always come from that one field, so an image tag can never disagree with the package version. The same directory works with `podman pull`/`podman run` unchanged.
 
 ### Option 2 — Docker Compose
 Suggested in issue https://github.com/AmanCode22/deeperseeker/issues/3; works with podman-compose too.
 
 Compose ships with ```build: .``` so you can run from source — but to run a released version, point it at the prebuilt image: add one  line under ```build: .``` in docker-compose.yml:
 
-```    image: ghcr.io/amancode22/deeperseeker:6.0   # run the release; build: stays as a fallback```
+```    image: ghcr.io/amancode22/deeperseeker:7.0   # run the release; build: stays as a fallback```
 
 With both keys present, docker compose pull fetches the release image and build: is only used if you explicitly pass --build.
 
@@ -271,6 +271,8 @@ The `cost` reported in API responses uses these flat rates.
 
 ## Project docs
 
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — request lifecycle, module map, token pool state machine, streaming and truncation rules. [中文](docs/ARCHITECTURE.zh-CN.md)
+- [docs/API.md](docs/API.md) — every endpoint with its auth, request fields and response shape. [中文](docs/API.zh-CN.md)
 - [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md) — point Claude Desktop at DeeperSeeker in a few minutes.
 - [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md) — which clients were tested, when, with what result.
 - [SECURITY.md](SECURITY.md) — how to report security issues.
