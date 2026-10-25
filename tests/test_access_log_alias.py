@@ -491,6 +491,8 @@ def test_cli_entrypoint_shows_alias(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
     response = None

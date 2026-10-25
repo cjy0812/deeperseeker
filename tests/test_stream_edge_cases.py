@@ -81,15 +81,16 @@ def test_fix1_flush_salvages_attribute_style_tool():
     assert f_text == "", f"no parameter values may leak as text, got {f_text!r}"
 
 
-def test_fix1_flush_salvages_truncated_json_tool():
-    """JSON-style tool whose arguments JSON is brace-truncated: flush() recovers
-    the tool via parse_tools' brace-balancing fallback."""
+def test_fix1_flush_drops_brace_truncated_json_tool():
+    """JSON-style tool cut inside its arguments JSON: dropped, not salvaged."""
     corpus = xml('[LT]tool_call[GT]{"name": "Bash", "arguments": {"command": "ls"')
     p = StreamToolParser()
     feed_all(p, corpus, 5)
     f_text, f_tools = flush_all(p)
-    assert names(f_tools) == ["Bash"], f"expected salvaged tool, got {f_tools}"
-    assert args_of(f_tools) == {"command": "ls"}
+    # Expectation changed (FIX 3/5): brace-padding used to manufacture
+    # a call carrying a prefix of the real arguments. Now it is dropped.
+    assert f_tools == [], f"truncated JSON tool must be dropped, got {f_tools}"
+    assert p.truncated is True, "the cut must be reported to the caller"
 
 
 def test_fix1_flush_drops_wrapper_noise_after_json():
@@ -511,7 +512,7 @@ def test_fix6_plural_function_calls_parse_tools():
 
 TESTS = [
     test_fix1_flush_salvages_attribute_style_tool,
-    test_fix1_flush_salvages_truncated_json_tool,
+    test_fix1_flush_drops_brace_truncated_json_tool,
     test_fix1_flush_drops_wrapper_noise_after_json,
     test_fix1_flush_unparseable_still_strips_to_text,
     test_fix2_hold_and_flush_edge_cases,

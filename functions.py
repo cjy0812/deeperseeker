@@ -950,7 +950,12 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
         try:
             json.loads(args_str)
         except Exception:
-            args_str = json.dumps(args_str)
+            # [FIX 4] An arguments string that is not valid JSON is a truncated
+            # or corrupted call. Wrapping it in json.dumps() produced a tool_use
+            # whose .input was a string instead of an object, which the client
+            # then failed to satisfy ("required parameter missing"). Drop the
+            # call instead of forwarding garbage.
+            return None
     else:
         args_str = json.dumps({})
     call_id = "call_" + "".join(
@@ -989,10 +994,67 @@ def _code_fence_spans(text):
     ]
 
 
+_TOOL_OPEN_FAMILY_RE = re.compile(
+    r"<[\uFF5C\|]{0,2}(?:DSML[\uFF5C\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke|function_call)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+_PARAM_OPEN_RE = re.compile(
+    r"<[\uFF5C\|]{0,2}(?:DSML[\uFF5C\|]{0,2})?\s*(?:parameter|param|invoke)"
+    r"\s+name=[\x27\x22][^\x27\x22]+[\x27\x22][^>]*>",
+    re.IGNORECASE,
+)
+_PARAM_CLOSE_RE = re.compile(
+    r"</[\uFF5C\|]{0,2}(?:DSML[\uFF5C\|]{0,2})?\s*(?:parameter|param|invoke)>",
+    re.IGNORECASE,
+)
+
+
+def _payload_is_complete(body):
+    if not body.strip():
+        return False
+    b = body.find("{")
+    if b != -1 and not _PARAM_OPEN_RE.search(body[:b]):
+        try:
+            json.JSONDecoder().raw_decode(body[b:])
+            return True
+        except ValueError:
+            return False
+    o = list(_PARAM_OPEN_RE.finditer(body))
+    if not o:
+        return False
+    return _PARAM_CLOSE_RE.search(body, o[-1].end()) is not None
+
+
+def tool_block_is_truncated(text):
+    """True when the LAST tool-call block in *text* never got a closer.
+
+    A truncated block means the upstream stream was cut mid-call, so the
+    parameters visible here may be a prefix of the real ones. Callers use
+    this to drop the incomplete tail instead of emitting a tool_use with
+    missing arguments ("required parameter missing" client-side).
+    """
+    if not text:
+        return False
+    fence_spans = _code_fence_spans(text)
+    opens = [
+        m
+        for m in _TOOL_OPEN_FAMILY_RE.finditer(text)
+        if not any(a <= m.start() < b for a, b in fence_spans)
+    ]
+    if not opens:
+        return False
+    if _TOOL_END_TAG_RE.search(text, opens[-1].end()) is not None:
+        return False
+    return not _payload_is_complete(text[opens[-1].end() :])
+
+
 def parse_tools(text):
     tools = []
     clean_text = text
     fence_spans = _code_fence_spans(text)
+    truncated = tool_block_is_truncated(text)
 
     def fenced(pos):
         return any(s <= pos < e for s, e in fence_spans)
@@ -1032,7 +1094,7 @@ def parse_tools(text):
             body = text[start_idx:end_idx]
             args = {}
             p_matches = re.finditer(
-                r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)",
+                r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=))",
                 body,
                 flags=re.DOTALL | re.IGNORECASE,
             )
@@ -1068,7 +1130,12 @@ def parse_tools(text):
                         args[t_name] = json.loads(t_val)
                     except Exception:
                         args[t_name] = t_val
-            if candidate_name:
+            # [FIX 2] The trailing block of a cut-off stream is a partial
+            # call: its visible args are a prefix, not the real ones. Drop
+            # it instead of emitting a tool_use the client cannot satisfy.
+            if candidate_name and not (
+                truncated and i == len(real_tool_matches) - 1
+            ):
                 norm = normalize_tool_call(candidate_name, args)
                 if norm:
                     tools.append(norm)
@@ -1087,7 +1154,7 @@ def parse_tools(text):
             flags=re.DOTALL | re.IGNORECASE,
         ).strip()
 
-    if not tools and "DSML" in text:
+    if not tools and not truncated and "DSML" in text:
         dsml_block_pattern = re.compile(
             r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)",
             re.DOTALL | re.IGNORECASE,
@@ -1161,7 +1228,7 @@ def parse_tools(text):
                 r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", clean_text, flags=re.IGNORECASE
             ).strip()
 
-    if not tools:
+    if not tools and not truncated:
         fn_call_pattern = re.compile(
             r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>",
             re.DOTALL | re.IGNORECASE,
@@ -1186,7 +1253,7 @@ def parse_tools(text):
                 flags=re.DOTALL | re.IGNORECASE,
             ).strip()
 
-    if not tools:
+    if not tools and not truncated:
         tag_regex = re.compile(
             r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
             re.IGNORECASE,
@@ -1204,18 +1271,12 @@ def parse_tools(text):
                     with contextlib.suppress(Exception):
                         data, _ = decoder.raw_decode(json_substr)
                     if not data:
-                        cleaned_json = re.sub(
-                            r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
-                            "",
-                            json_substr,
-                            flags=re.DOTALL,
-                        ).strip()
-                        open_b = cleaned_json.count("{")
-                        close_b = cleaned_json.count("}")
-                        if open_b > close_b:
-                            cleaned_json += "}" * (open_b - close_b)
-                        with contextlib.suppress(Exception):
-                            data = json.loads(cleaned_json)
+                        # [FIX 3] raw_decode() rejected this payload, which means
+                        # it is truncated or corrupted. Padding it with right
+                        # braces used to turn a half-written call into a
+                        # syntactically valid one with missing keys, surfacing
+                        # client-side as "required parameter missing". Drop it.
+                        data = None
                     if isinstance(data, dict):
                         if tag_name:
                             name = tag_name
@@ -1265,7 +1326,7 @@ def parse_tools(text):
                 flags=re.DOTALL,
             ).strip()
 
-    if not tools:
+    if not tools and not truncated:
         codeblock_pattern = r"```(?:tool_call|function_call)\s*(.*?)\s*```"
         cb_matches = list(re.finditer(codeblock_pattern, clean_text, flags=re.DOTALL))
         for m in cb_matches:
@@ -1296,7 +1357,7 @@ def parse_tools(text):
                 codeblock_pattern, "", clean_text, flags=re.DOTALL
             ).strip()
 
-    if not tools:
+    if not tools and not truncated:
         json_pattern = r"```json\s*(\{.*?\})\s*```"
         json_matches = list(re.finditer(json_pattern, clean_text, flags=re.DOTALL))
         for m in json_matches:
@@ -1468,6 +1529,10 @@ class StreamToolParser:
         self.has_tool = False
         self.json_done = False
         self._end_re = None
+        # [FIX 5] Set by flush() when the stream ended inside a tool block
+        # that never received its closer. app.py turns this into a truncated
+        # stop_reason instead of pretending the turn ended normally.
+        self.truncated = False
 
     def feed(self, chunk):
         self.buffer += chunk
@@ -1554,21 +1619,38 @@ class StreamToolParser:
         if self.buffer and not self.in_tool:
             _append_clean_text(out, self.buffer)
         elif self.in_tool:
-            # [FIX 1] Recover the tool before stripping: if the stream was cut
-            # off before the closing tag arrived but the payload itself is
-            # parseable, emit the tool call instead of dumping raw parameter
-            # values into the chat text. Strip only when nothing parses.
+            # [FIX 5] No closer arrived for the open block -> the upstream
+            # stream was cut. Previously this path still ran parse_tools()
+            # over the partial payload and emitted whatever it could parse,
+            # so the client received a tool_use with a prefix of the real
+            # arguments ("required parameter missing"). Drop it outright and
+            # record the truncation for the caller.
+            has_closer = bool(
+                (self._end_re and self._end_re.search(self.buffer))
+                or _TOOL_END_TAG_RE.search(self.buffer)
+            )
+            _gt = self.buffer.find(">")
+            _body = self.buffer[_gt + 1 :] if _gt != -1 else ""
+            # A missing outer closer is normal; only an incomplete payload
+            # (open parameter / brace-truncated JSON) means the cut landed
+            # inside the arguments and the visible args are just a prefix.
+            if not has_closer and not _payload_is_complete(_body):
+                self.truncated = True
+                stripped = _strip_wrapper_tags(self.buffer).strip()
+                if not self.json_done and stripped:
+                    # Nothing parsed at all and no JSON was consumed: this is
+                    # prose that merely looked like an opener. Keep it rather
+                    # than silently swallowing the user-visible text.
+                    out.append({"text": stripped})
+                self.buffer = ""
+                self.in_tool = False
+                self.json_done = False
+                self._end_re = None
+                return out
             parsed, _ = parse_tools(self.buffer)
             if parsed:
                 for item in parsed:
                     out.append({"tool": item})
-            elif not self.json_done:
-                stripped = _strip_wrapper_tags(self.buffer).strip()
-                if stripped:
-                    out.append({"text": stripped})
-            # With json_done set, whatever is left after the consumed JSON
-            # payload is wrapper noise (partial closers / whitespace) and is
-            # dropped instead of leaking into the chat text.
         self.buffer = ""
         self.in_tool = False
         self.json_done = False

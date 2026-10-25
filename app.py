@@ -63,6 +63,7 @@ from functions import (
     record_file,
     save_session,
     send_message,
+    tool_block_is_truncated,
     upload_file,
 )
 
@@ -1663,16 +1664,27 @@ async def stream_anthropic_response(
             tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
             block_index_local[0] += 1
 
+        # flush() must always run: besides draining leftover prose it sets
+        # parser.truncated when the stream ended inside a tool block that never
+        # received its closer, which is the signal FIX 7 maps to max_tokens.
+        flush_results = parser.flush()
         flushed_text = ""
         if not parsed_tools:
-            for r in parser.flush():
+            for r in flush_results:
                 if "text" in r:
                     flushed_text += r["text"]
+        truncated = parser.truncated
 
-        if not text_block_started and not parsed_tools and (clean_text or flushed_text):
-            tail_events += _tb(clean_text or flushed_text)
-        elif text_block_started and not parsed_tools:
+        # [FIX 6] A text block is closed whenever it was opened, regardless of
+        # whether tool blocks follow. Previously the stop was emitted only in
+        # the no-tools branch, so a text+tool reply left block 0 open and then
+        # reused index 0 for the tool_use block (index reuse + unclosed block).
+        if text_block_started:
             tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
+            block_index_local[0] += 1
+        elif not parsed_tools and (clean_text or flushed_text):
+            tail_events += _tb(clean_text or flushed_text)
+            block_index_local[0] += 1
 
         if parsed_tools:
             for tc in parsed_tools:
@@ -1686,9 +1698,15 @@ async def stream_anthropic_response(
                 tail_events += f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index_local[0], 'delta': {'type': 'input_json_delta', 'partial_json': json_str}})}\n\n"
                 tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
                 block_index_local[0] += 1
-            tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
+            _stop_reason = "tool_use"
         else:
-            tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
+            _stop_reason = "end_turn"
+        # [FIX 7] A truncated stream must not masquerade as a clean finish.
+        # Report max_tokens so the client retries/continues instead of
+        # executing a half-delivered turn as if it were complete.
+        if truncated:
+            _stop_reason = "max_tokens"
+        tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': _stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
         tail_events += (
             f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
         )
@@ -1722,6 +1740,11 @@ def _completion_usage_text(clean_text, parsed_tools):
 def format_response(text, model, messages, tools=None):
     from functions import DEEPSEEK_TARIFFS
 
+    # [FIX 7b] Same truncation signal as the streaming path. Without this the
+    # non-streaming route reported finish_reason "stop" for a reply the
+    # upstream cut mid-tool-call, so the client treated a half-delivered turn
+    # as complete.
+    truncated = tool_block_is_truncated(text)
     parsed_tools, clean_text = parse_tools(text)
 
     reasoning = None
@@ -1764,7 +1787,13 @@ def format_response(text, model, messages, tools=None):
             {
                 "index": 0,
                 "message": msg_dict,
-                "finish_reason": "tool_calls" if parsed_tools else "stop",
+                "finish_reason": (
+                    "length"
+                    if truncated
+                    else "tool_calls"
+                    if parsed_tools
+                    else "stop"
+                ),
             }
         ],
         "usage": {
@@ -1803,13 +1832,24 @@ def format_anthropic_response(result, model):
     msg_id = result["id"]
     if not msg_id.startswith("msg_"):
         msg_id = f"msg_{msg_id.replace('chatcmpl-', '')}"
+    # [FIX 7c] Propagate the truncation signal produced by format_response().
+    # finish_reason "length" means the upstream cut the reply mid-tool-call;
+    # reporting "tool_use"/"end_turn" here made the non-streaming Anthropic
+    # route look like a clean finish, so the client ran a half-delivered turn.
+    finish_reason = choice.get("finish_reason")
+    if finish_reason == "length":
+        stop_reason = "max_tokens"
+    elif msg.get("tool_calls"):
+        stop_reason = "tool_use"
+    else:
+        stop_reason = "end_turn"
     return {
         "id": msg_id,
         "type": "message",
         "role": "assistant",
         "content": ant_content,
         "model": model,
-        "stop_reason": "tool_use" if msg.get("tool_calls") else "end_turn",
+        "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
