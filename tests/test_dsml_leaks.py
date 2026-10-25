@@ -286,3 +286,27 @@ def test_unknown_tool_name_kept_without_schemas():
     )
     tools, _ = parse_tools(text)
     assert [t["function"]["name"] for t in tools] == ["bogus_tool"]
+
+
+def test_undeclared_residue_keys_pruned():
+    """Keys the tool schema never declares are residue, not arguments.
+
+    A value that embeds a nested parameter block ends at the inner opener, so
+    the remainder is re-read as sibling keys. Seen live as a Write carrying
+    ``command``/``description`` beside ``content``, which the client rejects
+    with "unexpected parameter".
+    """
+    token = request_tools.set(TOOLS)
+    try:
+        text = (
+            f'<{B}invoke name="bash">\n'
+            f'<{B}parameter name="command" string="true">ls</{B}parameter>\n'
+            f'<{B}parameter name="i" string="true">listing</{B}parameter>\n'
+            f'<{B}parameter name="junk" string="true">residue</{B}parameter>\n</{B}invoke>'
+        )
+        tools, _ = parse_tools(text)
+        assert [json.loads(t["function"]["arguments"]) for t in tools] == [
+            {"command": "ls", "i": "listing"}
+        ]
+    finally:
+        request_tools.reset(token)

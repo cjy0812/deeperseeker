@@ -252,25 +252,64 @@ def _infer_tool_name(args, schemas):
     return None
 
 
+def _prune_args(args, params):
+    """Drop argument keys *params* never declares; return (args, pruned_count).
+
+    A value that embeds a nested parameter block ends at the inner opener, so
+    the rest of the real value is re-read as sibling keys ("command" and
+    "description" turning up on a Write). Those are pure residue: the client
+    rejects them as "unexpected parameter". Keys are only pruned when the
+    schema enumerates properties and does not allow extras, so open schemas
+    keep accepting whatever the model sent.
+    """
+    props = params.get("properties") or {}
+    if not props or params.get("additionalProperties") is True:
+        return args, 0
+    kept = {k: v for k, v in args.items() if k in props}
+    return kept, len(args) - len(kept)
+
+
+def _required_emptied(args, params):
+    """True when a required field is missing or empty after pruning residue."""
+    for field in params.get("required") or []:
+        value = args.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return True
+    return False
+
+
 def _repair_tool_names(tools):
     schemas = _tool_schemas()
     if not schemas:
         return tools
+    kept = []
     for t in tools:
         fn = t["function"]
-        if fn["name"] in schemas:
-            continue
         try:
             args = json.loads(fn["arguments"])
         except Exception:
-            continue
+            args = None
         if isinstance(args, dict):
-            fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
-    # A name that still is not in the request's tool list names nothing the
-    # client has ("No such tool available: function_calls"); dropping the call
-    # beats forwarding one that cannot succeed. Empty schemas return above, so
-    # the schema-less CLI and test paths are unchanged.
-    return [t for t in tools if t["function"]["name"] in schemas]
+            if fn["name"] not in schemas:
+                fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
+            params = schemas.get(fn["name"])
+            if isinstance(params, dict):
+                pruned, count = _prune_args(args, params)
+                if count:
+                    # The pruned keys prove the value was cut at an inner
+                    # marker. If that left a required field blank, the call
+                    # carries a prefix of the real arguments and cannot be
+                    # satisfied -- same rule as a stream cut mid-call.
+                    if _required_emptied(pruned, params):
+                        continue
+                    fn["arguments"] = json.dumps(pruned)
+        # A name that still is not in the request's tool list names nothing the
+        # client has ("No such tool available: function_calls"); dropping the
+        # call beats forwarding one that cannot succeed. Empty schemas return
+        # above, so the schema-less CLI and test paths are unchanged.
+        if fn["name"] in schemas:
+            kept.append(t)
+    return kept
 
 
 
