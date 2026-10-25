@@ -40,8 +40,10 @@
             <tr>
                 <th>{{ t('dashboard.th_id') }}</th>
                 <th>{{ t('dashboard.th_alias') }}</th>
-                <th>{{ t('dashboard.th_token') }}</th>
                 <th>{{ t('dashboard.th_status') }}</th>
+                <th>{{ t('dashboard.th_in_flight') }}</th>
+                <th>{{ t('dashboard.th_last_used') }}</th>
+                <th>{{ t('dashboard.th_cooldown') }}</th>
                 <th>{{ t('dashboard.th_actions') }}</th>
             </tr>
         </thead>
@@ -49,14 +51,24 @@
             {% for tok in tokens %}
             <tr>
                 <td>{{ tok['id'] }}</td>
-                <td>{{ tok['alias'] or t('common.none') }}</td>
-                <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
+                <td>{{ tok['label'] or t('common.none') }}</td>
                 <td>
-                    <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
+                    {# The raw enum stays in the markup (data-status) so CSS and
+                       tests can key off it; only the visible text is localized. #}
+                    <span class="status {{ tok['state_class'] }}" data-status="{{ tok['status'] }}">
                         {{ status_label(tok['status']) }}
                     </span>
+                    <div class="state-note">{{ tok['state_note'] }}</div>
                 </td>
+                <td>{{ tok['in_flight'] }}</td>
+                <td>{{ tok['last_used'] }}</td>
+                <td>{{ tok['cooldown'] }}</td>
                 <td>
+                    {% if tok['can_restore'] %}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/restore" class="inline-form">
+                        <button type="submit" class="btn-sm">{{ t('dashboard.restore') }}</button>
+                    </form>
+                    {% endif %}
                     {# The confirm text goes through a data attribute, not into a
                        JS string literal: an apostrophe in a translation would
                        otherwise break out of the quote and kill the handler. #}
@@ -70,6 +82,11 @@
             {% endfor %}
         </tbody>
     </table>
+    <p class="state-note">
+        RATE_LIMITED cools down and rejoins by itself. QUARANTINED never does —
+        an auth failure or a repeated 403 takes the token out until Restore puts
+        it back. No token material is shown on this page.
+    </p>
     {% else %}
     <p>{{ t('dashboard.no_tokens') }}</p>
     {% endif %}
@@ -80,5 +97,40 @@
     <p>{{ t('dashboard.api_openai') }} <code>http://localhost:4000/v1</code></p>
     <p>{{ t('dashboard.api_anthropic') }} <code>http://localhost:4000</code></p>
     <p>{{ t('dashboard.api_model') }} <code>v4.1flash</code></p>
+</section>
+
+<section>
+    <h2>{{ t('dashboard.usage') }}</h2>
+    {% if usage_rows %}
+    <table>
+        <thead>
+            <tr>
+                <th>{{ t('dashboard.usage_day') }}</th>
+                <th>{{ t('dashboard.usage_key') }}</th>
+                <th>{{ t('dashboard.usage_surfaces') }}</th>
+                <th>{{ t('dashboard.usage_requests') }}</th>
+                <th>{{ t('dashboard.usage_input') }}</th>
+                <th>{{ t('dashboard.usage_output') }}</th>
+                <th>{{ t('dashboard.usage_cost') }}</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in usage_rows %}
+            <tr>
+                <td>{{ row['day'] }}</td>
+                <td>{{ row['key'] }}</td>
+                <td>{{ row['surfaces'] }}</td>
+                <td>{{ row['requests'] }}</td>
+                <td>{{ row['input_tokens'] }}</td>
+                <td>{{ row['output_tokens'] }}</td>
+                <td>${{ '%.6f'|format(row['cost']) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <p class="state-note">{{ t('dashboard.usage_note') }}</p>
+    {% else %}
+    <p class="state-note">{{ t('dashboard.usage_empty') }}</p>
+    {% endif %}
 </section>
 {% endblock %}

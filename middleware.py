@@ -24,12 +24,19 @@ import os
 import re
 import time
 import uuid
+from contextvars import ContextVar
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 import audit
 
 logger = logging.getLogger("uvicorn.error")
+
+# Per-request correlation id, readable from anywhere in the same request's
+# call chain (P0-4: the terminal empty-SSE envelope embeds it so a failing
+# response can be matched to its access-log line). Pure ASGI middleware runs
+# the route stack in the same task, so a plain ContextVar is safe here.
+request_id_var = ContextVar("deeperseeker_request_id", default="-")
 
 
 # ==============================================================================
@@ -164,7 +171,7 @@ class RequestIDMiddleware:
             inbound if _REQUEST_ID_RE.match(inbound or "") else uuid.uuid4().hex
         )
         state["request_id"] = request_id
-        # Ambient audit fields for everything this request emits. The route
+# Ambient audit fields for everything this request emits. The route
         # handlers below add model/stream/scope via bind_request() and the
         # store helpers inherit the lot through audit.record()'s ContextVar -
         # no Request object has to be threaded into handle_chat or the
@@ -173,6 +180,9 @@ class RequestIDMiddleware:
             request_id=request_id,
             endpoint=scope.get("path"),
         )
+        # Upstream's ContextVar carrier for the same id: it survives into the
+        # detached stream generators that audit's ContextVar does not reach.
+        request_id_var.set(request_id)
 
         started = time.perf_counter()
         status_holder = {"status": None}

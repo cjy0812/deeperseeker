@@ -303,7 +303,10 @@ def test_handle_chat_rotates_to_another_token_on_429():
     async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
         return "prompt"
 
-    def fake_limited(tid, **kwargs):
+    def fake_limited(tid, *a, **k):
+        # P0-3: mark_limited now also receives the upstream status code and the
+        # audit `reason=` keyword; the recorded token id is what this test
+        # asserts on, so the stub swallows both and still reports only the id.
         calls["limited"].append(tid)
 
     patches = [

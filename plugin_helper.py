@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from functions import count_tokens, get_session, upload_file
+from functions import count_tokens, get_session, request_effort, upload_file
 
 # Token budgets for injected history when (re)building a session prompt.
 MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
@@ -39,6 +39,18 @@ OBSERVED_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEKER_MAX_OUTPUT_TOKENS", "8192
 ROLLOVER_SAFETY_TOKENS = int(os.getenv("DEEPSEEKER_ROLLOVER_SAFETY_TOKENS", "24000"))
 # Token budget for the model-generated handoff summary.
 MAX_SUMMARY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_TOKENS", "4096"))
+# DSH fix: hard cap for the LATEST user message embedded in a prompt. The
+# first-message path accepts ~1M tokens upstream, but nothing above that
+# ceiling can ever succeed — and before this cap existed, an oversized single
+# message (an agent harness replaying its whole context) failed identically on
+# every retry because the payload was never shrunk. The cap sits just below
+# the observed first-message acceptance so the capped prompt still passes.
+MAX_USER_MESSAGE_TOKENS = int(os.getenv("DEEPSEEKER_MAX_USER_MESSAGE_TOKENS", "900000"))
+# DSH fix: flat overhead added to the rollover estimate for the tokens the
+# client-visible history does NOT contain but the upstream session DOES
+# accumulate: tool schemas, system expansion, handoff summaries, per-turn
+# instructions and the model's own reasoning across turns.
+PROMPT_OVERHEAD_TOKENS = int(os.getenv("DEEPSEEKER_PROMPT_OVERHEAD_TOKENS", "4096"))
 
 
 def context_window_tokens():
@@ -61,13 +73,20 @@ def estimate_conversation_tokens(messages):
     return _count_tokens(_messages_plain_text(messages))
 
 
-def needs_rollover(messages):
+def needs_rollover(messages, tools=None):
     """Decide keep-current-chat vs summarize-and-roll-over.
 
     Returns True when the accumulated session context is nearing the observed
     remembered-context limit. The very first exchange (system/user + assistant,
     however large — a single first message passes upstream up to ~1M tokens)
     is never rolled over; rollover exists purely for accumulated context.
+
+    DSH fix: the estimate now includes what the upstream session actually
+    carries beyond the client-visible text — the tool-schema block (a harness
+    with a dozen tools adds 10-20K tokens upstream that the old estimate never
+    saw) plus a flat overhead for system expansion, handoff summaries and
+    per-turn instructions. Without this, the estimate crossed the threshold
+    well AFTER the upstream session had already died.
     """
     non_system = [m for m in messages if m.get("role") != "system"]
     # First exchange only: one user turn, optionally answered by the assistant
@@ -76,7 +95,11 @@ def needs_rollover(messages):
         [m for m in non_system if m.get("role") in ("user", "assistant")]
     ) <= 2 and not any(m.get("role") == "tool" for m in non_system):
         return False
-    return estimate_conversation_tokens(messages) > context_window_tokens()
+    total = estimate_conversation_tokens(messages)
+    if tools:
+        with contextlib.suppress(TypeError, ValueError):
+            total += count_tokens(json.dumps(tools))
+    return total + PROMPT_OVERHEAD_TOKENS > context_window_tokens()
 
 
 def _messages_plain_text(messages):
@@ -146,11 +169,22 @@ def build_summary_request_prompt(messages):
     )
 
 
+# DeepSeek is trained on its DSML tool format and keeps writing it (its own
+# earlier calls stay in the upstream chat history), so ask for exactly that
+# instead of a competing <tool_call> JSON format the model mixes it with.
 TOOL_USE_INSTRUCTIONS = (
-    "TOOL USE INSTRUCTIONS:\n"
-    "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
-    '<tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n'
-    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
+    "TOOL USE INSTRUCTIONS (from the API harness, not part of any tool result):\n"
+    "To call tools, end your reply with exactly this block and write nothing after it:\n"
+    "<｜｜DSML｜｜function_calls>\n"
+    '<｜｜DSML｜｜invoke name="tool_name">\n'
+    '<｜｜DSML｜｜parameter name="text_param" string="true">plain text value</｜｜DSML｜｜parameter>\n'
+    '<｜｜DSML｜｜parameter name="other_param" string="false">{"json": ["value"]}</｜｜DSML｜｜parameter>\n'
+    "</｜｜DSML｜｜invoke>\n"
+    "</｜｜DSML｜｜function_calls>\n"
+    "Rules: close every parameter with </｜｜DSML｜｜parameter> before the next one starts; "
+    'string="true" for strings, string="false" for numbers, booleans, arrays and objects (valid JSON); '
+    "several invoke blocks may go inside one function_calls block; never put DSML tags inside a value; "
+    "only use tool and parameter names from the tool list."
 )
 
 
@@ -200,10 +234,19 @@ def strip_summary_tags(text):
 
 
 async def extract_system(messages):
+    parts = []
     for i in messages:
         if i.get("role") == "system":
-            return i.get("content")
-    return None
+            c = i.get("content", "")
+            if isinstance(c, list):
+                c = "\n".join(
+                    p.get("text", "")
+                    for p in c
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            if c:
+                parts.append(str(c))
+    return "\n\n".join(parts) if parts else None
 
 
 async def extract_tools(tools):
@@ -212,10 +255,10 @@ async def extract_tools(tools):
     final_tools = []
     for i in tools:
         if i.get("type") == "function":
-            fn = i.get("function", {})
+            fn = i.get("function") if isinstance(i.get("function"), dict) else i
             name = fn.get("name", "")
             desc = fn.get("description", "")
-            params = fn.get("parameters", {})
+            params = fn.get("parameters", fn.get("input_schema", {}))
             final_tools.append(
                 f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}"
             )
@@ -243,11 +286,21 @@ async def extract_tool_results(messages, latest_only=False):
                 break
         if last_ast_idx != -1:
             target_messages = messages[last_ast_idx + 1 :]
+    # DSML calls carry no ids, so the model can't match parallel results to its calls
+    # by "Call ID" alone; echo each call's arguments next to its result.
+    call_args = {}
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+                call_args[tc.get("id")] = (
+                    tc["function"].get("name"),
+                    str(tc["function"].get("arguments") or "")[:300],
+                )
     tools_final = []
     for i in target_messages:
         if i.get("role") == "tool":
-            name = i.get("name", "tool")
             call_id = i.get("tool_call_id", "")
+            name = i.get("name") or call_args.get(call_id, ("tool",))[0] or "tool"
             content = i.get("content", "")
             if isinstance(content, list):
                 content = " ".join(
@@ -256,7 +309,11 @@ async def extract_tool_results(messages, latest_only=False):
                     if isinstance(c, dict) and c.get("type") == "text"
                 )
             content = _trim_to_budget(str(content), PER_TOOL_RESULT_TOKENS)
-            tools_final.append(f"Tool: {name} (Call ID: {call_id})\nResult: {content}")
+            args = call_args.get(call_id, (None, ""))[1]
+            header = f"Tool: {name} (Call ID: {call_id})"
+            if args:
+                header += f"\nArguments: {args}"
+            tools_final.append(f"{header}\nResult: {content}")
     return "\n\n".join(tools_final) if tools_final else None
 
 
@@ -343,11 +400,12 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
                         elif k[0] == "success":
                             result_fileids.append(k[1]["file_id"])
             elif j["type"] == "file":
-                if "file_id" in j["file"]:
-                    result_fileids.append(j["file"]["file_id"])
-                if "file_data" in j["file"]:
-                    filename = j["file"].get("filename") or "file.bin"
-                    data_parts = j["file"]["file_data"].split(",", 1)
+                file_obj = j.get("file") if isinstance(j.get("file"), dict) else j
+                if file_obj.get("file_id"):
+                    result_fileids.append(file_obj["file_id"])
+                if file_obj.get("file_data"):
+                    filename = file_obj.get("filename") or "file.bin"
+                    data_parts = file_obj["file_data"].split(",", 1)
                     if len(data_parts) != 2:
                         continue
                     mimetype_base, base64_data = data_parts
@@ -548,12 +606,36 @@ async def generate_signature(messages, model, scope=""):
     return generate_signature_sync(messages, model, scope)
 
 
+# DeepSeek web has one thinking mode (DeepThink on/off), so effort above medium is
+# approximated by asking for more reasoning; measured ~1.1-2.4x longer thinking.
+# "high" gets no instruction: in agent sessions it multiplied reasoning length
+# (median 452 -> 7401 chars) and long reasoning hit DeepSeek's cut-off (INCOMPLETE).
+EFFORT_INSTRUCTIONS = {
+    "max": (
+        "[REASONING EFFORT: max] Before answering, reason exhaustively in your thinking: try at least two "
+        "different approaches, check edge cases, verify every step and re-check the final answer "
+        "independently. Take as long as needed."
+    ),
+}
+for _alias in ("xhigh", "ultra", "extreme"):
+    EFFORT_INSTRUCTIONS[_alias] = EFFORT_INSTRUCTIONS["max"]
+
+
+def _with_effort(prompt):
+    instruction = EFFORT_INSTRUCTIONS.get(request_effort.get() or "")
+    return prompt + instruction + "\n" if instruction else prompt
+
+
 async def build_prompt(
     messages, tools, model, is_first_message=False, rollover_summary=None
 ):
     final_prompt = ""
     tools_extract = await extract_tools(tools)
-    if is_first_message and (rollover_summary or needs_rollover(messages)):
+    # PR #67 review fix (Medium): pass the tools through — the tool-aware
+    # estimate (tool schemas + prompt overhead) is the whole point of the DSH
+    # fix, and this decision point was still calling it tool-blind, i.e. with
+    # exactly the underestimate the fix removed everywhere else.
+    if is_first_message and (rollover_summary or needs_rollover(messages, tools)):
         # Accumulated context is nearing the observed limit: hand off to a
         # fresh chat seeded with a model-generated summary instead of blindly
         # truncating the oldest history. Restore the full runtime contract
@@ -574,8 +656,16 @@ async def build_prompt(
             final_prompt += f"[TOOL RESULTS]\n{relevant_tool_results}\n\n"
         user_msg = await extract_user_msg(messages)
         if user_msg:
+            # DSH fix: the seed prompt must fit under the first-message
+            # ceiling no matter what the client sent — an oversized latest
+            # message is tail-truncated with a marker, never forwarded raw.
+            user_msg = _capped_text(
+                user_msg,
+                MAX_USER_MESSAGE_TOKENS,
+                "[... beginning of the message truncated to fit the context limit ...]",
+            )
             final_prompt += f"[USER]\n{user_msg}\n\n"
-        return final_prompt.strip() + "\n\n"
+        return _with_effort(final_prompt.strip() + "\n\n")
     if is_first_message:
         final_prompt = await append_fresh_session_runtime(
             final_prompt, messages, tools_extract
@@ -615,6 +705,15 @@ async def build_prompt(
 
         user_msg = await extract_user_msg(messages)
         if user_msg:
+            # DSH fix: a first message over the observed ~975K acceptance
+            # ceiling fails upstream with a hard rejection, and the retry used
+            # to re-send it verbatim until the budget died. Cap it — tail kept
+            # — so the turn passes instead of dying.
+            user_msg = _capped_text(
+                user_msg,
+                MAX_USER_MESSAGE_TOKENS,
+                "[... beginning of the message truncated to fit the context limit ...]",
+            )
             final_prompt += f"[USER]\n{user_msg}\n\n"
     else:
         last_ast_idx = -1
@@ -635,29 +734,51 @@ async def build_prompt(
             )
             final_prompt += f"[TOOL RESULTS]\n{tools_result_extract}\n\n"
 
+        trailing_sys_parts = []
         trailing_user_parts = []
         for m in trailing_messages:
-            if m.get("role") == "user":
+            if m.get("role") in ("user", "system"):
                 c = m.get("content", "")
+                txt = ""
                 if isinstance(c, str) and c:
-                    trailing_user_parts.append(c)
+                    txt = c
                 elif isinstance(c, list):
                     txt = " ".join(
                         part.get("text", "")
                         for part in c
                         if isinstance(part, dict) and part.get("type") == "text"
                     )
-                    if txt:
+                if txt:
+                    if m.get("role") == "system":
+                        trailing_sys_parts.append(txt)
+                    else:
                         trailing_user_parts.append(txt)
 
+        if trailing_sys_parts:
+            final_prompt += f"[SYSTEM]\n{chr(10).join(trailing_sys_parts)}\n\n"
+
         if trailing_user_parts:
-            final_prompt += f"[USER]\n{chr(10).join(trailing_user_parts)}\n\n"
+            trailing_user_text = chr(10).join(trailing_user_parts)
+            # DSH fix: a continuation turn rides on top of everything the
+            # upstream chat already remembers — an uncapped huge user message
+            # here is what pushed remembered chats over the limit.
+            trailing_user_text = _capped_text(
+                trailing_user_text,
+                MAX_USER_MESSAGE_TOKENS,
+                "[... beginning of the message truncated to fit the context limit ...]",
+            )
+            final_prompt += f"[USER]\n{trailing_user_text}\n\n"
         elif not tools_result_extract:
             user_msg = await extract_user_msg(messages)
             if user_msg:
+                user_msg = _capped_text(
+                    user_msg,
+                    MAX_USER_MESSAGE_TOKENS,
+                    "[... beginning of the message truncated to fit the context limit ...]",
+                )
                 final_prompt += f"[USER]\n{user_msg}\n\n"
 
         if tools_extract:
             final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
 
-    return final_prompt
+    return _with_effort(final_prompt)

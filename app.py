@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import mimetypes
@@ -38,8 +39,13 @@ security = HTTPBasic()
 
 
 from functions import (
+    effort_level,
+    request_effort,
+    request_tools,
+    token_busy,
     CookieGenerationError,
     StreamToolParser,
+    UpstreamError,
     acquire_token_slot,
     add_token,
     close_session,
@@ -52,19 +58,25 @@ from functions import (
     get_auth_token,
     get_file_content,
     get_file_token,
+    get_pool_view,
     get_token,
     get_tokens,
     init_db,
+    is_context_limit_error,
     mark_active,
     mark_limited,
+    mask_api_key,
     next_parent,
     parse_tools,
     pick_token,
     record_file,
+    record_usage,
+    restore_token,
     save_session,
     send_message,
     tool_block_is_truncated,
     upload_file,
+    usage_by_day_key,
 )
 
 
@@ -117,6 +129,13 @@ def _ensure_api_key():
     Idempotent and cheap after the first call. Every read site goes through
     here, so nothing depends on the key being ready at import time."""
     global _api_key_cache, _api_key_generated
+    # An explicit binding in the module dict wins over resolution. This is the
+    # half of the PEP 562 contract below that tests rely on: patching
+    # ``app.API_KEY`` must be the same thing the auth check sees. ``globals()``
+    # is read directly so this does not recurse through __getattr__.
+    override = globals().get("API_KEY")
+    if override is not None:
+        return override
     if _api_key_cache is None:
         _api_key_cache, _api_key_generated = _resolve_api_key()
     return _api_key_cache
@@ -133,7 +152,13 @@ def __getattr__(name):
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
-from middleware import RealIPMiddleware, RecovererMiddleware, RequestIDMiddleware
+import official_api
+from middleware import (
+    RealIPMiddleware,
+    RecovererMiddleware,
+    RequestIDMiddleware,
+    request_id_var,
+)
 from plugin_helper import (
     MAX_SUMMARY_TOKENS,
     build_prompt,
@@ -196,6 +221,74 @@ def _log_security_banner():
 # The banner is emitted from the lifespan hook, not here: it reports whether the
 # key was generated, which is only known after _ensure_api_key() has run — and
 # that must not happen at import time (plan 1.4).
+
+
+def _enforce_exposure_policy():
+    """P0-8 (Day 16): default dashboard credentials never meet a non-loopback bind.
+
+    B9 made the boot matrix honest about insecure defaults, but Boot 3 —
+    admin/admin while binding a public interface — only *warned*. Anyone who
+    can reach the dashboard owns the token pool, so that boot now refuses to
+    start and names the exact fix, the ds2api failure class killed at boot
+    time instead of in a postmortem. Boot 2 (defaults + loopback) keeps the
+    landed warn-loud behavior: local development must stay zero-config.
+
+    The override exists for deliberate, e.g. firewalled deployments:
+    DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1 accepts the risk explicitly (any other
+    value keeps the refusal).
+    """
+    host = (os.getenv("HOST") or "").strip().lower()
+    loopback = host in ("", "127.0.0.1", "localhost", "::1")
+    if loopback:
+        return
+    default_admin = ADMIN_USER == "admin" and ADMIN_PASSWORD == "admin"
+    if not default_admin:
+        return
+    if os.getenv("DEEPSEEKER_ALLOW_DEFAULT_ADMIN", "").strip() == "1":
+        logger.error(
+            "SECURITY: DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1 — the dashboard keeps "
+            "admin/admin on a NON-LOOPBACK host (%s) by explicit request. This "
+            "is exactly the exposed-relay configuration that got ds2api killed.",
+            host or "0.0.0.0",
+        )
+        return
+    raise SystemExit(
+        "\n"
+        "SECURITY: refusing to start — the dashboard uses the default admin/admin\n"
+        "credentials while binding a NON-LOOPBACK host (%s). Anyone who can reach\n"
+        "this service owns its token pool.\n"
+        "Fix one of these and start again:\n"
+        "  1. set DEEPSEEKER_ADMIN_USER and DEEPSEEKER_ADMIN_PASSWORD to\n"
+        "     non-default values (recommended), or\n"
+        "  2. keep HOST on 127.0.0.1 / localhost (local-only), or\n"
+        "  3. set DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1 to accept the risk explicitly\n"
+        "     (not recommended).\n" % (host or "0.0.0.0")
+    )
+
+
+_enforce_exposure_policy()
+
+# P0-2 (Day 20): the startup log states exactly what is running. The version
+# comes from the installed package metadata (pyproject), the build commit is
+# stamped by the release workflow as a build arg -> env, and both degrade
+# gracefully for source checkouts (version "dev", commit "-").
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    try:
+        APP_VERSION = _pkg_version("deeperseeker")
+    except PackageNotFoundError:
+        APP_VERSION = "dev"
+except ImportError:  # pragma: no cover
+    APP_VERSION = "dev"
+BUILD_COMMIT = (os.getenv("DEEPSEEKER_BUILD_COMMIT") or "-")[:12]
+logger.info(
+    "deeperseeker %s (commit %s) starting — Python %s",
+    APP_VERSION,
+    BUILD_COMMIT,
+    __import__("sys").version.split()[0],
+)
 
 # The token used for this request, logged as "key: <alias>".
 # Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
@@ -580,14 +673,77 @@ def _api_error_response(e, is_anthropic=False):
         code = 503  # WAF cookies cannot be produced right now — upstream unreachable, not a client error
     if code < 400 or code > 599:
         code = 502
+    # P0-7: official-mode error bodies carry upstream text too — every
+    # client-visible error body passes the secret scrub, one discipline.
+    message = _redact_secret_material(str(e)[:500])
     if is_anthropic:
         payload = {
             "type": "error",
-            "error": {"type": "api_error", "message": str(e)[:500]},
+            "error": {"type": "api_error", "message": message},
         }
     else:
         err_type = "rate_limit_error" if code == 429 else "api_error"
-        payload = {"error": {"message": str(e)[:500], "type": err_type, "code": code}}
+        payload = {"error": {"message": message, "type": err_type, "code": code}}
+    return JSONResponse(payload, status_code=code)
+
+
+# P0-4: credential-shaped material must never reach a client-visible error
+# body, even when the text came out of an upstream SSE error event. Scrub the
+# shapes DeepSeek traffic actually carries — long hex/base64 runs (session and
+# message ids, token material) and Bearer schemes — before the terminal
+# envelope is built.
+_SECRET_RUN_RE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+_BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._+=/-]+")
+
+
+def _redact_secret_material(text):
+    scrubbed = _BEARER_RE.sub("[redacted]", str(text))
+    scrubbed = _SECRET_RUN_RE.sub("[redacted]", scrubbed)
+    return scrubbed
+
+
+def _terminal_error_response(e, is_anthropic=False):
+    """P0-4 (Day 13): the budget-exhausted exit returns a DESIGNED envelope.
+
+    When every pooled token failed — the #33 terminal empty-SSE class — the
+    client used to get whatever str(exception) happened to carry: no trace id,
+    no status contract, upstream text verbatim. This exit reuses the typed
+    UpstreamError machinery (B6) for the status, passes the message through
+    the secret scrub above, and stamps the request's correlation id so the
+    response, the access log and the pool view tell one story. There is no
+    second error path: _api_error_response still owns the mid-retry shapes.
+
+    The trace id travels in the OpenAI body as request_id, and inside the
+    Anthropic message text (their error objects have no extra-field
+    contract); the X-Request-ID header rides along on both regardless.
+    """
+    code = _upstream_http_code(e) or 502
+    if isinstance(e, CookieGenerationError):
+        code = 503
+    if code < 400 or code > 599:
+        code = 502
+    trace = request_id_var.get()
+    if trace == "-":
+        trace = uuid.uuid4().hex  # direct invocation path (tests, scripts)
+    message = _redact_secret_material(str(e)[:500])
+    if is_anthropic:
+        payload = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": f"{message} [trace: {trace}]",
+            },
+        }
+    else:
+        err_type = "rate_limit_error" if code == 429 else "api_error"
+        payload = {
+            "error": {
+                "message": message,
+                "type": err_type,
+                "code": code,
+                "request_id": trace,
+            }
+        }
     return JSONResponse(payload, status_code=code)
 
 
@@ -609,6 +765,8 @@ def _referenced_file_ids(messages):
                 and part["file"].get("file_id")
             ):
                 ids.append(part["file"]["file_id"])
+            elif part.get("type") == "file" and part.get("file_id"):
+                ids.append(part["file_id"])
             elif (
                 part.get("type") in ("document", "image")
                 and isinstance(part.get("source"), dict)
@@ -694,6 +852,19 @@ def _replay_stream(gen, first):
     return _wrapped()
 
 
+async def _record_usage_safe(scope, surface, model, in_tokens, out_tokens):
+    """P0-6: record one completed turn. Failure-proof by design — a stats
+    write must never break (or delay beyond a thread hop) a served response.
+    The key is masked here so raw key material never reaches the store."""
+    try:
+        return await _db(
+            record_usage, mask_api_key(scope), surface, model, in_tokens, out_tokens
+        )
+    except Exception:
+        logger.warning("usage record failed (non-fatal)", exc_info=True)
+        return None
+
+
 async def _preflight_stream(gen):
     """Consume the first chunk eagerly so upstream errors surface before streaming starts."""
     try:
@@ -710,6 +881,11 @@ async def _preflight_stream(gen):
 # returns the upstream error (502-class) with the redacted trace.
 MAX_UPSTREAM_ATTEMPTS = max(1, int(os.getenv("DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS", "3")))
 
+# How to restart the current chat request on another account; set by handle_chat
+# and used by stream_response when DeepSeek drops the stream before any visible
+# output reached the client (None once the attempt budget is spent).
+_stream_retry = contextvars.ContextVar("stream_retry", default=None)
+
 
 async def handle_chat(
     messages,
@@ -724,15 +900,58 @@ async def handle_chat(
     _attempt=0,
     _auth_rotated=False,
     _exclude_token=None,
+    _context_retried=False,
+    is_responses=False,
+    response_opts=None,
 ):
+    request_tools.set(tools)
+    _stream_retry.set(
+        None
+        if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS
+        else lambda failed_token: handle_chat(
+            messages,
+            model,
+            thinking,
+            search,
+            stream,
+            tools,
+            is_anthropic,
+            req_model,
+            scope,
+            _attempt=_attempt + 1,
+            _exclude_token=failed_token,
+            is_responses=is_responses,
+            response_opts=response_opts,
+        )
+    )
     auth_token = await _db(get_auth_token)
     if not auth_token:
         return JSONResponse(
             {"error": "No auth token. Add via dashboard."}, status_code=401
         )
 
-    sig = await generate_signature(messages, model, scope)
+    has_prior_turn = any(
+        m.get("role") in ("assistant", "tool") for m in messages
+    ) or bool(
+        isinstance(response_opts, dict) and response_opts.get("previous_response_id")
+    )
+    if (
+        is_responses
+        and not has_prior_turn
+        and isinstance(response_opts, dict)
+        and response_opts.get("_resp_id")
+    ):
+        sig = str(response_opts["_resp_id"])
+    else:
+        sig = await generate_signature(messages, model, scope)
     sess = await _db(find_session, sig)
+    if (
+        not sess
+        and is_responses
+        and isinstance(response_opts, dict)
+        and response_opts.get("previous_response_id")
+    ):
+        sess = await _db(find_session, str(response_opts["previous_response_id"]))
     rollover_summary = None
     ref_ids = []  # B4: file ids referenced by the conversation (set by the create path)
 
@@ -741,7 +960,17 @@ async def handle_chat(
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
         tok = await _db(get_token, token_id)
-        if not tok or tok["status"] == "RATE_LIMITED":
+        # P0-3: anything that is not ACTIVE is unusable for this session, so a
+        # quarantined token bound by a stored signature rotates away like a
+        # cooled-down one. (Rate-limited is still transient; quarantine is not.)
+        # A conversation whose account is busy generating moves to an
+        # idle account (fresh chat, full history) instead of queueing behind it.
+        moved_off_busy = False
+        if tok and tok["status"] == "ACTIVE" and token_busy(tok["token"]):
+            cand = await _db(pick_token)
+            cand_tok = await _db(get_token, cand) if cand and cand != token_id else None
+            moved_off_busy = bool(cand_tok) and not token_busy(cand_tok["token"])
+        if not tok or tok["status"] != "ACTIVE" or moved_off_busy:
             new_token_id = await _db(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = await _db(get_token, new_token_id)
@@ -758,7 +987,7 @@ async def handle_chat(
                         await _db(delete_sessions_for_chat, token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
                         rot_owner = await _own_chat_lock(new_session_id)
-                        if needs_rollover(messages):
+                        if _context_retried or needs_rollover(messages, tools):
                             scratch_chat = await create_new_chat(new_tok["token"])
                             summary_gen = send_message(
                                 scratch_chat,
@@ -817,6 +1046,8 @@ async def handle_chat(
                             req_model,
                             scope,
                             _attempt=_attempt + 1,
+                            is_responses=is_responses,
+                            response_opts=response_opts,
                         )
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner, rot_slot)
@@ -833,6 +1064,23 @@ async def handle_chat(
                                     req_model,
                                     0,
                                     scope,
+                                ),
+                                media_type="text/event-stream",
+                            )
+                        if is_responses:
+                            return StreamingResponse(
+                                stream_responses_response(
+                                    gen,
+                                    model,
+                                    messages,
+                                    new_token_id,
+                                    new_session_id,
+                                    sig,
+                                    tools,
+                                    req_model,
+                                    0,
+                                    scope,
+                                    response_opts,
                                 ),
                                 media_type="text/event-stream",
                             )
@@ -873,6 +1121,8 @@ async def handle_chat(
                                 req_model,
                                 scope,
                                 _attempt=_attempt + 1,
+                                is_responses=is_responses,
+                                response_opts=response_opts,
                             )
                         await _db(mark_active, new_token_id)
                         rot_slot.release()
@@ -910,6 +1160,20 @@ async def handle_chat(
                             new_session_id,
                             next_parent(0),
                         )
+                        if (
+                            is_responses
+                            and isinstance(response_opts, dict)
+                            and response_opts.get("_resp_id")
+                        ):
+                            r_id = response_opts["_resp_id"]
+                            await _db(
+                                save_session,
+                                r_id,
+                                new_token_id,
+                                new_session_id,
+                                next_parent(0),
+                            )
+                            _store_response_history(r_id, next_messages)
                         if rot_owner is not None:
                             rot_owner.release()
                         return format_response(resp_text, model, messages, tools)
@@ -968,7 +1232,7 @@ async def handle_chat(
                 # that summary via build_prompt(rollover_summary=...). A single large
                 # first exchange is untouched (the first-message path accepts ~1M
                 # tokens); this only fires for accumulated session context.
-                if needs_rollover(messages):
+                if _context_retried or needs_rollover(messages, tools):
                     scratch_chat = await create_new_chat(tok["token"])
                     summary_gen = send_message(
                         scratch_chat,
@@ -1045,7 +1309,9 @@ async def handle_chat(
                 # parent_message_id (which would fork the upstream exchange).
                 parent_message_id = fresh["parent_message_id"]
 
-        if parent_message_id != 0 and needs_rollover(messages):
+        if parent_message_id != 0 and (
+            _context_retried or needs_rollover(messages, tools)
+        ):
             logger.info(
                 "Context rollover: accumulated context over limit; purging session mappings for chat %s",
                 session_id,
@@ -1137,6 +1403,23 @@ async def handle_chat(
                     ),
                     media_type="text/event-stream",
                 )
+            if is_responses:
+                return StreamingResponse(
+                    stream_responses_response(
+                        gen,
+                        model,
+                        messages,
+                        token_id,
+                        session_id,
+                        sig,
+                        tools,
+                        req_model,
+                        parent_message_id,
+                        scope,
+                        response_opts,
+                    ),
+                    media_type="text/event-stream",
+                )
             return StreamingResponse(
                 stream_response(
                     gen,
@@ -1184,6 +1467,34 @@ async def handle_chat(
                 session_id,
                 next_parent(parent_message_id),
             )
+            if (
+                is_responses
+                and isinstance(response_opts, dict)
+                and response_opts.get("_resp_id")
+            ):
+                r_id = response_opts["_resp_id"]
+                await _db(
+                    save_session,
+                    r_id,
+                    token_id,
+                    session_id,
+                    next_parent(parent_message_id),
+                )
+                _store_response_history(r_id, next_messages)
+            # P0-6: one row per completed turn, B7 semantics (cleaned reply
+            # billing) — the same numbers the response's usage block reports.
+            surface = (
+                "anthropic"
+                if is_anthropic
+                else ("responses" if is_responses else "openai")
+            )
+            await _record_usage_safe(
+                scope,
+                surface,
+                req_model or model,
+                count_tok(_messages_text(messages)),
+                count_tok(_completion_usage_text(clean_text, parsed_tools)),
+            )
             return format_response(resp_text, model, messages, tools)
     except asyncio.CancelledError:
         # B2 (Stage 1 audit): the client went away mid-request — the exchange
@@ -1195,10 +1506,11 @@ async def handle_chat(
     except Exception as e:
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            # reason= is the audit vocabulary: a real HTTP 429 and an SSE
-            # rate_limit_reached event both arrive here as 429, and only
-            # UpstreamError.origin separates them for the audit breakdown.
-            await _db(mark_limited, token_id, reason=_rate_limit_reason(e))
+            # code drives quarantine (401/403); reason= is the audit
+            # vocabulary — a real HTTP 429 and an SSE rate_limit_reached
+            # event both arrive here as 429, and only UpstreamError.origin
+            # separates them for the audit breakdown.
+            await _db(mark_limited, token_id, code, reason=_rate_limit_reason(e))
             await _db(delete_sessions_for_chat, token_id, session_id)
             if not _auth_rotated:
                 new_token_id = await _db(pick_token)
@@ -1224,6 +1536,9 @@ async def handle_chat(
                         _attempt=_attempt,
                         _auth_rotated=True,
                         _exclude_token=token_id,
+                        _context_retried=_context_retried,
+                        is_responses=is_responses,
+                        response_opts=response_opts,
                     )
             logger.warning(
                 "Chat request rejected by upstream (session %s, parent %s): %s",
@@ -1241,9 +1556,29 @@ async def handle_chat(
         )
         await _db(delete_sessions_for_chat, token_id, session_id)
         if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
-            # B10: budget exhausted — surface the (already redacted/truncated)
-            # upstream error instead of retrying forever.
-            return _api_error_response(e, is_anthropic)
+            # B10: budget exhausted. P0-4: surface the DESIGNED terminal
+            # envelope — redacted body, trace id, status contract — instead of
+            # the raw exception dump.
+            return _terminal_error_response(e, is_anthropic)
+        # DSH fix: a context-class failure is not a token problem — the
+        # context belongs to the upstream CHAT, so the plain retry (fresh
+        # chat, 24K-capped history) recovered the request but amputated the
+        # conversation, and the lossy reset is what made agent harnesses
+        # experience 'context limit' deaths. Classify it and make the retry
+        # a FORCED summary rollover instead: the fresh chat is seeded with a
+        # model-generated handoff summary, keeping full continuity. One
+        # context retry per turn: the forced flag is NOT sticky (review fix,
+        # PR #67) — `_context_retried or context_class` kept it pinned for
+        # the whole remaining budget, forcing an extra upstream summary call
+        # on every later attempt. Once the forced attempt has run, the rest
+        # of the budget retries normally.
+        force_context_retry = bool(is_context_limit_error(e)) and not _context_retried
+        if force_context_retry:
+            logger.warning(
+                "Context-class upstream failure on chat %s (%s); the retry will force a summary rollover",
+                session_id,
+                _redact_secret_material(str(e))[:200],
+            )
         # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
         # call can resolve to the SAME chat (the retry re-derives the session
         # from whatever the persistence layer still returns). Recursing while
@@ -1271,6 +1606,9 @@ async def handle_chat(
             _attempt=_attempt + 1,
             _auth_rotated=_auth_rotated,
             _exclude_token=token_id,
+            _context_retried=force_context_retry,
+            is_responses=is_responses,
+            response_opts=response_opts,
         )
     finally:
         if not lock_transferred:
@@ -1371,6 +1709,7 @@ async def stream_response(
     is_thinking = False
     aborted = False
     failed = False
+    sent_content = False  # visible text reached the client (reasoning does not count)
     try:
         async for chunk in _hold_think_tags(gen):
             if not chunk:
@@ -1400,6 +1739,7 @@ async def stream_response(
 
             for r in parser.feed(chunk):
                 if "text" in r:
+                    sent_content = True
                     yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
         await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
@@ -1423,17 +1763,32 @@ async def stream_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            # reason= is the audit vocabulary: a real HTTP 429 and an SSE
-            # rate_limit_reached event both arrive here as 429, and only
-            # UpstreamError.origin separates them for the audit breakdown.
-            await _db(mark_limited, token_id, reason=_rate_limit_reason(e))
+            # code drives quarantine (401/403); reason= is the audit
+            # vocabulary — a real HTTP 429 and an SSE rate_limit_reached
+            # event both arrive here as 429, and only UpstreamError.origin
+            # separates them for the audit breakdown.
+            await _db(mark_limited, token_id, code, reason=_rate_limit_reason(e))
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_response failed")
-        with suppress(Exception):
-            yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
+        # Dropped before any visible text or tool call reached the client: run the
+        # request again on another account and stream that instead of the error.
+        retry = _stream_retry.get()
+        retried = None
+        if not sent_content and retry is not None:
+            logger.warning(
+                "stream_response: upstream failed before any output, retrying on another account"
+            )
+            with suppress(Exception):
+                retried = await retry(token_id)
+        if isinstance(retried, StreamingResponse):
+            async for part in retried.body_iterator:
+                yield part
+        else:
+            with suppress(Exception):
+                yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
         clean_text = re.sub(
@@ -1499,6 +1854,10 @@ async def stream_response(
                 # think-tag reasoning and tool markup are not billed output.
                 usage_out = _completion_usage_text(clean_text, parsed_tools)
                 out_tokens = count_tok(usage_out) if usage_out else 0
+                # P0-6: completed streamed turns record exactly one usage row
+                # (aborted/failed streams record nothing, mirroring the skip
+                # above so a partial response never pollutes billing).
+                await _record_usage_safe(scope, "openai", model, in_tokens, out_tokens)
                 usage_chunk = _chat_chunk([], cid=cid, created=created, model=model)
                 usage_chunk["usage"] = {
                     "prompt_tokens": in_tokens,
@@ -1598,10 +1957,11 @@ async def stream_anthropic_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            # reason= is the audit vocabulary: a real HTTP 429 and an SSE
-            # rate_limit_reached event both arrive here as 429, and only
-            # UpstreamError.origin separates them for the audit breakdown.
-            await _db(mark_limited, token_id, reason=_rate_limit_reason(e))
+            # code drives quarantine (401/403); reason= is the audit
+            # vocabulary — a real HTTP 429 and an SSE rate_limit_reached
+            # event both arrive here as 429, and only UpstreamError.origin
+            # separates them for the audit breakdown.
+            await _db(mark_limited, token_id, code, reason=_rate_limit_reason(e))
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
         else:
@@ -1713,6 +2073,15 @@ async def stream_anthropic_response(
 
         if not aborted and not failed:
             try:
+                # P0-6: one usage row per completed Anthropic stream, same
+                # cleaned-reply semantics as the tail usage event below it.
+                await _record_usage_safe(
+                    scope,
+                    "anthropic",
+                    req_model if req_model else model,
+                    in_tokens,
+                    out_tokens,
+                )
                 for evt in tail_events.split("\n\n"):
                     if evt.strip():
                         yield evt + "\n\n"
@@ -1856,6 +2225,718 @@ def format_anthropic_response(result, model):
             "output_tokens": usage.get("completion_tokens", 0),
         },
     }
+
+
+_response_history = OrderedDict()
+RESPONSE_HISTORY_MAX = 2048
+GENERIC_RESPONSE_ERROR = "An internal error occurred while generating the response."
+
+
+def _store_response_history(resp_id, msgs):
+    if not resp_id:
+        return
+    copied = [dict(m) for m in msgs]
+    _response_history[resp_id] = copied
+    _response_history.move_to_end(resp_id)
+    while len(_response_history) > RESPONSE_HISTORY_MAX:
+        _response_history.popitem(last=False)
+
+
+def _normalize_responses_tools(tools):
+    if not isinstance(tools, list):
+        return []
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function":
+            fn = t.get("function") if isinstance(t.get("function"), dict) else t
+            strict_val = fn.get("strict", t.get("strict"))
+            out.append(
+                {
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description"),
+                    "parameters": fn.get(
+                        "parameters",
+                        fn.get("input_schema", {"type": "object", "properties": {}}),
+                    ),
+                    "strict": strict_val if isinstance(strict_val, bool) else True,
+                }
+            )
+        else:
+            out.append(t)
+    return out
+
+
+def _responses_usage(in_tokens, out_tokens):
+    return {
+        "input_tokens": in_tokens,
+        "input_tokens_details": {
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+        "output_tokens": out_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": 0,
+        },
+        "total_tokens": in_tokens + out_tokens,
+    }
+
+
+def _responses_effort(opts):
+    reasoning_cfg = opts.get("reasoning")
+    effort = reasoning_cfg.get("effort") if isinstance(reasoning_cfg, dict) else None
+    if effort is None and isinstance(reasoning_cfg, str):
+        effort = reasoning_cfg
+    if effort is None:
+        for key in ("reasoning_effort", "effort"):
+            candidate = opts.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                effort = candidate
+                break
+    if isinstance(effort, str) and effort.strip().lower() in (
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    ):
+        return effort.strip().lower()
+    return None
+
+
+def _build_response_object(
+    resp_id,
+    created_at,
+    model,
+    output,
+    status="completed",
+    usage=None,
+    completed_at=None,
+    error=None,
+    opts=None,
+):
+    opts = opts if isinstance(opts, dict) else {}
+    reasoning_cfg = opts.get("reasoning")
+    effort = _responses_effort(opts)
+    if isinstance(reasoning_cfg, dict):
+        reasoning_obj = {
+            "effort": effort,
+            "summary": reasoning_cfg.get("summary"),
+        }
+    else:
+        reasoning_obj = {
+            "effort": effort,
+            "summary": None,
+        }
+    text_cfg = opts.get("text")
+    if not isinstance(text_cfg, dict) or not isinstance(text_cfg.get("format"), dict):
+        text_cfg = {"format": {"type": "text"}}
+    metadata = opts.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    parallel_tc = opts.get("parallel_tool_calls")
+    if not isinstance(parallel_tc, bool):
+        parallel_tc = True
+    store_val = opts.get("store")
+    if not isinstance(store_val, bool):
+        store_val = True
+    temp_val = opts.get("temperature")
+    temp_val = float(temp_val) if isinstance(temp_val, (int, float)) else 1.0
+    top_p_val = opts.get("top_p")
+    top_p_val = float(top_p_val) if isinstance(top_p_val, (int, float)) else 1.0
+    top_logprobs = opts.get("top_logprobs")
+    top_logprobs = top_logprobs if isinstance(top_logprobs, int) else 0
+    truncation = opts.get("truncation")
+    if truncation not in ("auto", "disabled"):
+        truncation = "disabled"
+    background = opts.get("background")
+    if not isinstance(background, bool):
+        background = False
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "completed_at": completed_at,
+        "background": background,
+        "error": error,
+        "incomplete_details": None,
+        "instructions": opts.get("instructions"),
+        "max_output_tokens": opts.get("max_output_tokens"),
+        "max_tool_calls": opts.get("max_tool_calls"),
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": parallel_tc,
+        "previous_response_id": opts.get("previous_response_id"),
+        "reasoning": reasoning_obj,
+        "service_tier": opts.get("service_tier") or "default",
+        "store": store_val,
+        "temperature": temp_val,
+        "text": text_cfg,
+        "tool_choice": (
+            opts.get("tool_choice") if opts.get("tool_choice") is not None else "auto"
+        ),
+        "tools": _normalize_responses_tools(opts.get("tools")),
+        "top_logprobs": top_logprobs,
+        "top_p": top_p_val,
+        "truncation": truncation,
+        "usage": usage,
+        "user": opts.get("user"),
+        "metadata": metadata,
+    }
+
+
+def format_responses_response(result, model=None, opts=None):
+    choice = result["choices"][0]
+    msg = choice["message"]
+    output = []
+
+    if msg.get("reasoning_content"):
+        output.append(
+            {
+                "id": f"rs_{uuid.uuid4().hex}",
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [
+                    {
+                        "type": "summary_text",
+                        "text": msg["reasoning_content"],
+                    }
+                ],
+            }
+        )
+
+    tool_calls = msg.get("tool_calls") or []
+    content_text = msg.get("content")
+    if content_text is not None or not tool_calls:
+        output.append(
+            {
+                "id": f"msg_{uuid.uuid4().hex}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content_text or "",
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ],
+            }
+        )
+
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        raw_args = fn.get("arguments", "{}")
+        args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args)
+        output.append(
+            {
+                "id": f"fc_{uuid.uuid4().hex}",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                "name": fn.get("name", ""),
+                "arguments": args_str,
+            }
+        )
+
+    raw_usage = result.get("usage", {})
+    in_tokens = raw_usage.get("prompt_tokens", raw_usage.get("input_tokens", 0))
+    out_tokens = raw_usage.get("completion_tokens", raw_usage.get("output_tokens", 0))
+    preset_id = opts.get("_resp_id") if isinstance(opts, dict) else None
+    raw_id = str(result.get("id", ""))
+    if preset_id:
+        resp_id = preset_id
+    elif raw_id.startswith("resp_"):
+        resp_id = raw_id
+    elif raw_id.startswith("chatcmpl-"):
+        resp_id = f"resp_{raw_id[len('chatcmpl-') :].replace('-', '')}"
+    else:
+        resp_id = f"resp_{uuid.uuid4().hex}"
+    created_at = int(result.get("created", result.get("created_at", time.time())))
+    completed_at = int(time.time())
+    model_name = model or result.get("model", SINGLE_MODEL)
+    return _build_response_object(
+        resp_id,
+        created_at,
+        model_name,
+        output,
+        status="completed",
+        usage=_responses_usage(in_tokens, out_tokens),
+        completed_at=completed_at,
+        error=None,
+        opts=opts,
+    )
+
+
+async def stream_responses_response(
+    gen,
+    model,
+    messages,
+    token_id,
+    session_id,
+    sig,
+    tools,
+    req_model=None,
+    parent_message_id=0,
+    scope="",
+    opts=None,
+):
+    preset_id = opts.get("_resp_id") if isinstance(opts, dict) else None
+    resp_id = preset_id or f"resp_{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    model_name = req_model if req_model else model
+    seq = 0
+    output_index = 0
+    completed_output = []
+    rs_id = None
+    rs_index = None
+    rs_started = False
+    rs_closed = False
+    rs_text = ""
+    msg_id = None
+    msg_index = None
+    msg_started = False
+    msg_text = ""
+
+    def _sse(payload):
+        nonlocal seq
+        payload["sequence_number"] = seq
+        seq += 1
+        return f"event: {payload['type']}\ndata: {json.dumps(payload)}\n\n"
+
+    def _open_rs():
+        nonlocal rs_id, rs_index, output_index, rs_started
+        rs_id = f"rs_{uuid.uuid4().hex}"
+        rs_index = output_index
+        output_index += 1
+        rs_started = True
+        return [
+            _sse(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": rs_index,
+                    "item": {
+                        "id": rs_id,
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": rs_id,
+                    "output_index": rs_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                }
+            ),
+        ]
+
+    def _close_rs():
+        nonlocal rs_closed
+        rs_closed = True
+        rs_part = {"type": "summary_text", "text": rs_text}
+        rs_item = {
+            "id": rs_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [rs_part],
+        }
+        completed_output.append(rs_item)
+        return [
+            _sse(
+                {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": rs_id,
+                    "output_index": rs_index,
+                    "summary_index": 0,
+                    "text": rs_text,
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": rs_id,
+                    "output_index": rs_index,
+                    "summary_index": 0,
+                    "part": rs_part,
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": rs_index,
+                    "item": rs_item,
+                }
+            ),
+        ]
+
+    def _open_msg():
+        nonlocal msg_id, msg_index, output_index, msg_started
+        msg_id = f"msg_{uuid.uuid4().hex}"
+        msg_index = output_index
+        output_index += 1
+        msg_started = True
+        return [
+            _sse(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": msg_index,
+                    "item": {
+                        "id": msg_id,
+                        "type": "message",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.content_part.added",
+                    "item_id": msg_id,
+                    "output_index": msg_index,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": "",
+                        "annotations": [],
+                        "logprobs": [],
+                    },
+                }
+            ),
+        ]
+
+    def _delta_msg(text):
+        nonlocal msg_text
+        frames = _open_msg() if not msg_started else []
+        msg_text += text
+        frames.append(
+            _sse(
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id,
+                    "output_index": msg_index,
+                    "content_index": 0,
+                    "delta": text,
+                    "logprobs": [],
+                }
+            )
+        )
+        return frames
+
+    initial_resp = _build_response_object(
+        resp_id,
+        created_at,
+        model_name,
+        [],
+        status="in_progress",
+        usage=None,
+        completed_at=None,
+        error=None,
+        opts=opts,
+    )
+    yield _sse({"type": "response.created", "response": initial_resp})
+    yield _sse({"type": "response.in_progress", "response": initial_resp})
+
+    parser = StreamToolParser()
+    full_text = ""
+    aborted = False
+    failed = False
+
+    try:
+        is_thinking = False
+        async for chunk in _hold_think_tags(gen):
+            if not chunk:
+                continue
+            full_text += chunk
+
+            if "<think>" in chunk:
+                is_thinking = True
+                chunk = chunk.replace("<think>", "").lstrip("\n")
+                if not rs_started:
+                    for f in _open_rs():
+                        yield f
+
+            end_thinking = False
+            if "</think>" in chunk:
+                is_thinking = False
+                end_thinking = True
+                parts = chunk.split("</think>")
+                think_part = parts[0]
+                chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
+                if think_part:
+                    if not rs_started:
+                        for f in _open_rs():
+                            yield f
+                    rs_text += think_part
+                    yield _sse(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": rs_id,
+                            "output_index": rs_index,
+                            "summary_index": 0,
+                            "delta": think_part,
+                        }
+                    )
+
+            if is_thinking and chunk:
+                rs_text += chunk
+                yield _sse(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": rs_id,
+                        "output_index": rs_index,
+                        "summary_index": 0,
+                        "delta": chunk,
+                    }
+                )
+                continue
+
+            if end_thinking:
+                if rs_started and not rs_closed:
+                    for f in _close_rs():
+                        yield f
+                if not chunk:
+                    continue
+
+            for r in parser.feed(chunk):
+                if "text" in r and r["text"]:
+                    if not msg_started and not r["text"].strip():
+                        continue
+                    for f in _delta_msg(r["text"]):
+                        yield f
+        await _db(mark_active, token_id)
+    except (asyncio.CancelledError, GeneratorExit):
+        aborted = True
+        failed = True
+        try:
+            await _db(delete_sessions_for_chat, token_id, session_id)
+        except Exception:
+            logger.exception(
+                "stream_responses_response: failed to purge session rows after client abort"
+            )
+        raise
+    except Exception as e:
+        failed = True
+        code = _upstream_http_code(e)
+        if code in (401, 403, 429):
+            await _db(mark_limited, token_id, code)
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.warning("stream_responses_response upstream HTTP %s: %s", code, e)
+        else:
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.exception("stream_responses_response failed")
+        with suppress(Exception):
+            failed_resp = _build_response_object(
+                resp_id,
+                created_at,
+                model_name,
+                completed_output,
+                status="failed",
+                usage=None,
+                completed_at=None,
+                error={"code": "server_error", "message": GENERIC_RESPONSE_ERROR},
+                opts=opts,
+            )
+            yield _sse({"type": "response.failed", "response": failed_resp})
+    finally:
+        parsed_tools, clean_text = parse_tools(full_text)
+        clean_text = re.sub(
+            r"<think>.*?</think>", "", clean_text, flags=re.DOTALL
+        ).strip()
+        clean_text = re.sub(
+            r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>",
+            "",
+            clean_text,
+            flags=re.IGNORECASE,
+        ).strip()
+        flushed_chunks = []
+        if not parsed_tools:
+            for r in parser.flush():
+                if "text" in r and r["text"]:
+                    if not msg_started and not flushed_chunks and not r["text"].strip():
+                        continue
+                    flushed_chunks.append(r["text"])
+        combined_stream_text = msg_text + "".join(flushed_chunks)
+        final_text = combined_stream_text if combined_stream_text else clean_text
+        in_tokens = count_tok(_messages_text(messages))
+        usage_out = _completion_usage_text(clean_text, parsed_tools)
+        out_tokens = count_tok(usage_out) if usage_out else 0
+
+        if not failed:
+            next_messages = messages.copy()
+            ast_msg = {"role": "assistant"}
+            if parsed_tools:
+                ast_msg["tool_calls"] = parsed_tools
+            else:
+                ast_msg["content"] = final_text.strip()
+            next_messages.append(ast_msg)
+            next_sig = generate_signature_sync(next_messages, model, scope)
+            await _db(
+                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+            )
+            await _db(
+                save_session,
+                next_sig,
+                token_id,
+                session_id,
+                next_parent(parent_message_id),
+            )
+            await _db(
+                save_session,
+                resp_id,
+                token_id,
+                session_id,
+                next_parent(parent_message_id),
+            )
+            _store_response_history(resp_id, next_messages)
+
+        if not aborted and not failed:
+            try:
+                if rs_started and not rs_closed:
+                    for f in _close_rs():
+                        yield f
+
+                if not parsed_tools:
+                    for fc in flushed_chunks:
+                        for f in _delta_msg(fc):
+                            yield f
+                    if not msg_started:
+                        for f in _delta_msg(clean_text) if clean_text else _open_msg():
+                            yield f
+
+                if msg_started:
+                    final_part = {
+                        "type": "output_text",
+                        "text": final_text,
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                    final_msg_item = {
+                        "id": msg_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [final_part],
+                    }
+                    completed_output.append(final_msg_item)
+                    yield _sse(
+                        {
+                            "type": "response.output_text.done",
+                            "item_id": msg_id,
+                            "output_index": msg_index,
+                            "content_index": 0,
+                            "text": final_text,
+                            "logprobs": [],
+                        }
+                    )
+                    yield _sse(
+                        {
+                            "type": "response.content_part.done",
+                            "item_id": msg_id,
+                            "output_index": msg_index,
+                            "content_index": 0,
+                            "part": final_part,
+                        }
+                    )
+                    yield _sse(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": msg_index,
+                            "item": final_msg_item,
+                        }
+                    )
+
+                if parsed_tools:
+                    for tc in parsed_tools:
+                        fn = tc.get("function", {})
+                        raw_args = fn.get("arguments", "{}")
+                        args_str = (
+                            raw_args
+                            if isinstance(raw_args, str)
+                            else json.dumps(raw_args)
+                        )
+                        fc_id = f"fc_{uuid.uuid4().hex}"
+                        call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+                        fn_name = fn.get("name", "")
+                        fc_index = output_index
+                        output_index += 1
+                        yield _sse(
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": fc_index,
+                                "item": {
+                                    "id": fc_id,
+                                    "type": "function_call",
+                                    "status": "in_progress",
+                                    "call_id": call_id,
+                                    "name": fn_name,
+                                    "arguments": "",
+                                },
+                            }
+                        )
+                        yield _sse(
+                            {
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": fc_id,
+                                "output_index": fc_index,
+                                "delta": args_str,
+                            }
+                        )
+                        yield _sse(
+                            {
+                                "type": "response.function_call_arguments.done",
+                                "item_id": fc_id,
+                                "output_index": fc_index,
+                                "arguments": args_str,
+                            }
+                        )
+                        fc_item = {
+                            "id": fc_id,
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": call_id,
+                            "name": fn_name,
+                            "arguments": args_str,
+                        }
+                        completed_output.append(fc_item)
+                        yield _sse(
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": fc_index,
+                                "item": fc_item,
+                            }
+                        )
+
+                completed_resp = _build_response_object(
+                    resp_id,
+                    created_at,
+                    model_name,
+                    completed_output,
+                    status="completed",
+                    usage=_responses_usage(in_tokens, out_tokens),
+                    completed_at=int(time.time()),
+                    error=None,
+                    opts=opts,
+                )
+                yield _sse({"type": "response.completed", "response": completed_resp})
+                # P0-6: one usage row per completed Responses stream — the
+                # same in/out numbers the completed event just carried.
+                await _record_usage_safe(
+                    scope,
+                    "responses",
+                    model_name,
+                    in_tokens,
+                    out_tokens,
+                )
+            except asyncio.CancelledError:
+                pass
 
 
 @app.post("/v1/files")
@@ -2065,10 +3146,42 @@ def is_thinking_enabled(body, request=None):
     elif isinstance(thinking_val, bool):
         return thinking_val
 
+    reasoning_val = body.get("reasoning")
+    if isinstance(reasoning_val, dict):
+        r_effort = (
+            reasoning_val.get("effort")
+            or reasoning_val.get("reasoning_effort")
+            or reasoning_val.get("level")
+        )
+        if r_effort is not None:
+            e_str = str(r_effort).strip().lower()
+            if e_str in [
+                "medium",
+                "high",
+                "max",
+                "ultra",
+                "extreme",
+                "xhigh",
+                "enabled",
+                "adaptive",
+                "on",
+            ]:
+                return True
+            if e_str in [
+                "low",
+                "minimal",
+                "none",
+                "off",
+                "disable",
+                "disabled",
+                "false",
+            ]:
+                return False
+
     reasoning_effort = body.get("reasoning_effort")
     if reasoning_effort is not None:
         effort_str = str(reasoning_effort).strip().lower()
-        if effort_str in ["medium", "high", "max", "ultra", "extreme"]:
+        if effort_str in ["medium", "high", "max", "ultra", "extreme", "xhigh"]:
             return True
         if effort_str in ["low", "minimal", "none", "off", "disable", "disabled"]:
             return False
@@ -2147,38 +3260,177 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
     model = resolve_model(body.get("model"))
     thinking = is_thinking_enabled(body, request)
+    request_effort.set(effort_level(body) if thinking else None)
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
+    # P0-7: official passthrough — same handler, different upstream. The
+    # mode is explicit (DEEPSEEKER_MODE=official); no silent fallback.
+    if official_api.official_mode_enabled():
+        return await _official_chat_response(body, model, stream, tools, request)
     return await handle_chat(
         messages, model, thinking, search, stream, tools, scope=get_api_key(request)
     )
 
 
-def _responses_input_to_messages(inputs):
-    """Map the Responses API `input` array onto chat messages.
+_OFFICIAL_PASSTHROUGH_FIELDS = (
+    "messages",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "response_format",
+    "stop",
+)
 
-    Stage 1 minor list: `input_image` parts are now mapped onto the
-    chat-completions image shape (the vision path already exists upstream);
-    previously only input_text/input_file were recognized and images were
-    passed through untouched."""
+
+async def _official_chat_response(body, model, stream, tools, request):
+    """P0-7: serve /v1/chat/completions from the official API.
+
+    Same auth (checked by the caller), same usage recording (surface
+    'official', masked key, B7-independent because upstream reports real
+    usage), tools forwarded in native OpenAI format. The official key never
+    enters logs or error bodies (official_api redacts).
+    """
+    payload = {k: body[k] for k in _OFFICIAL_PASSTHROUGH_FIELDS if k in body}
+    payload["model"] = official_api.map_model(model)
+    if tools:
+        payload["tools"] = tools
+    if not stream:
+        try:
+            result = await official_api.official_chat(payload, stream=False)
+        except UpstreamError as e:
+            return _api_error_response(e, is_anthropic=False)
+        usage = result.get("usage") or {}
+        await _record_usage_safe(
+            get_api_key(request),
+            "official",
+            result.get("model") or payload["model"],
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+        )
+        return JSONResponse(result)
+    scope = get_api_key(request)
+
+    async def _gen():
+        total_in = total_out = 0
+        try:
+            async for line in official_api.official_chat(payload, stream=True):
+                if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                    try:
+                        chunk = json.loads(line[len("data: ") :])
+                        usage = chunk.get("usage")
+                        if usage:
+                            total_in = usage.get("prompt_tokens", total_in)
+                            total_out = usage.get("completion_tokens", total_out)
+                    except json.JSONDecodeError:
+                        pass
+                yield line
+        except UpstreamError as e:
+            # mid-stream failure: same discipline as the bridge streams —
+            # an error frame into the open stream, then stop
+            with suppress(Exception):
+                yield f"data: {json.dumps({'error': {'message': _redact_secret_material(str(e))[:300]}})}\n\n"
+            return
+        await _record_usage_safe(
+            scope, "official", payload["model"], total_in, total_out
+        )
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+def _responses_input_to_messages(inputs):
+    if isinstance(inputs, (str, dict)):
+        inputs = [inputs]
     messages = []
+    call_names = {}
     for item in inputs:
         if isinstance(item, str):
             messages.append({"role": "user", "content": item})
             continue
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            continue
+        if item_type == "function_call":
+            raw_args = item.get("arguments", "{}")
+            args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args)
+            call_id = (
+                item.get("call_id")
+                or item.get("id")
+                or ("call_" + uuid.uuid4().hex[:8])
+            )
+            fn_name = item.get("name", "")
+            if call_id and fn_name:
+                call_names[call_id] = fn_name
+            tc = {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": fn_name,
+                    "arguments": args_str,
+                },
+            }
+            if messages and messages[-1].get("role") == "assistant":
+                messages[-1].setdefault("tool_calls", []).append(tc)
+            else:
+                messages.append(
+                    {"role": "assistant", "content": None, "tool_calls": [tc]}
+                )
+            continue
+        if item_type == "function_call_output":
+            out_val = item.get("output", "")
+            if isinstance(out_val, list):
+                out_val = " ".join(
+                    p.get("text", "")
+                    for p in out_val
+                    if isinstance(p, dict)
+                    and p.get("type") in ("input_text", "output_text", "text")
+                )
+            elif not isinstance(out_val, str):
+                out_val = json.dumps(out_val)
+            call_id = item.get("call_id") or item.get("id") or ""
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": out_val,
+            }
+            t_name = item.get("name") or call_names.get(call_id)
+            if t_name:
+                tool_msg["name"] = t_name
+            messages.append(tool_msg)
+            continue
 
         role = item.get("role", "user")
+        if role == "developer":
+            role = "system"
         content = item.get("content", [])
         msg_content = []
         if isinstance(content, str):
             msg_content = content
         else:
             for c in content:
-                if c.get("type") == "input_text":
+                if isinstance(c, str):
+                    msg_content.append({"type": "text", "text": c})
+                elif not isinstance(c, dict):
+                    continue
+                elif c.get("type") in ("input_text", "output_text"):
                     msg_content.append({"type": "text", "text": c.get("text")})
+                elif c.get("type") == "refusal":
+                    msg_content.append({"type": "text", "text": c.get("refusal", "")})
                 elif c.get("type") == "input_file":
-                    msg_content.append({"type": "file", "file_id": c.get("file_id")})
+                    if c.get("file_data"):
+                        msg_content.append(
+                            {
+                                "type": "file",
+                                "file_data": c.get("file_data"),
+                                "filename": c.get("filename"),
+                            }
+                        )
+                    else:
+                        msg_content.append(
+                            {"type": "file", "file_id": c.get("file_id")}
+                        )
                 elif c.get("type") == "input_image":
                     url = c.get("image_url")
                     if isinstance(url, dict):
@@ -2195,11 +3447,31 @@ def _responses_input_to_messages(inputs):
                         msg_content.append(c)
                 else:
                     msg_content.append(c)
+        if (
+            role == "assistant"
+            and isinstance(msg_content, list)
+            and all(
+                isinstance(p, dict) and p.get("type") == "text" for p in msg_content
+            )
+        ):
+            msg_content = "\n".join(p.get("text", "") for p in msg_content)
+        if role == "assistant" and messages and messages[-1].get("role") == "assistant":
+            prev_c = messages[-1].get("content")
+            if not prev_c:
+                messages[-1]["content"] = msg_content
+            elif isinstance(prev_c, str) and isinstance(msg_content, str):
+                messages[-1]["content"] = (
+                    f"{prev_c}\n{msg_content}" if msg_content else prev_c
+                )
+            elif isinstance(prev_c, list) and isinstance(msg_content, list):
+                prev_c.extend(msg_content)
+            continue
         messages.append({"role": role, "content": msg_content})
     return messages
 
 
 @app.post("/v1/responses")
+@app.post("/responses")
 async def openai_responses(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
@@ -2211,47 +3483,90 @@ async def openai_responses(request: Request):
 
     messages = _responses_input_to_messages(inputs)
 
+    instructions = body.get("instructions")
+    if isinstance(instructions, list):
+        inst_msgs = _responses_input_to_messages(instructions)
+        inst_text = "\n".join(
+            _messages_text([m]) for m in inst_msgs if _messages_text([m])
+        )
+    elif isinstance(instructions, str):
+        inst_text = instructions
+    else:
+        inst_text = ""
+
+    text_cfg = body.get("text")
+    if (
+        isinstance(text_cfg, dict)
+        and isinstance(text_cfg.get("format"), dict)
+        and text_cfg["format"].get("type") == "json_schema"
+    ):
+        json_schema = text_cfg["format"].get("schema")
+        if json_schema:
+            schema_inst = f"You MUST return valid JSON adhering strictly to this JSON Schema:\n{json.dumps(json_schema)}"
+            inst_text = f"{inst_text}\n\n{schema_inst}" if inst_text else schema_inst
+
+    prev_resp_id = body.get("previous_response_id")
+    if (
+        prev_resp_id
+        and prev_resp_id in _response_history
+        and not any(m.get("role") == "assistant" for m in messages)
+    ):
+        prev_msgs = [dict(m) for m in _response_history[prev_resp_id]]
+        if inst_text and not (
+            prev_msgs
+            and prev_msgs[0].get("role") == "system"
+            and prev_msgs[0].get("content") == inst_text
+        ):
+            if prev_msgs and prev_msgs[0].get("role") == "system":
+                prev_msgs[0] = {"role": "system", "content": inst_text}
+            else:
+                prev_msgs.insert(0, {"role": "system", "content": inst_text})
+        messages = prev_msgs + messages
+    elif inst_text:
+        messages.insert(0, {"role": "system", "content": inst_text})
+
     thinking = is_thinking_enabled(body, request)
-    search = body.get("search", False)
-    stream = body.get("stream", False)
-    tools = body.get("tools", None)
+    request_effort.set(effort_level(body) if thinking else None)
+    search = bool(body.get("search", False))
+    stream = bool(body.get("stream", False))
+    raw_tools = body.get("tools", None)
+    chat_tools = None
+    if isinstance(raw_tools, list):
+        chat_tools = []
+        for t in raw_tools:
+            if not isinstance(t, dict):
+                continue
+            t_type = str(t.get("type", ""))
+            if t_type.startswith("web_search"):
+                search = True
+            else:
+                chat_tools.append(t)
+        if not chat_tools:
+            chat_tools = None
+
+    response_opts = dict(body)
+    response_opts["thinking"] = thinking
+    response_opts["_resp_id"] = f"resp_{uuid.uuid4().hex}"
 
     result = await handle_chat(
-        messages, model, thinking, search, stream, tools, scope=get_api_key(request)
+        messages,
+        model,
+        thinking,
+        search,
+        stream,
+        chat_tools,
+        scope=get_api_key(request),
+        is_responses=True,
+        response_opts=response_opts,
     )
 
     if stream:
         return result
 
     if isinstance(result, dict) and "choices" in result:
-        message = result["choices"][0]["message"]
-        out_content = []
-        if message.get("content"):
-            out_content.append({"type": "text", "text": message["content"]})
-        if message.get("tool_calls"):
-            out_content.extend(
-                [
-                    {
-                        "type": "tool_call",
-                        "id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "arguments": tc["function"]["arguments"],
-                    }
-                    for tc in message["tool_calls"]
-                ]
-            )
-
-        msg_output = {"type": "message", "role": "assistant", "content": out_content}
-        if message.get("reasoning_content"):
-            msg_output["reasoning_content"] = message["reasoning_content"]
-
-        return {
-            "id": result["id"],
-            "object": "response",
-            "model": result["model"],
-            "output": [msg_output],
-            "usage": result.get("usage", {}),
-        }
+        return format_responses_response(
+            result, result.get("model", model), response_opts
+        )
     return result
 
 
@@ -2418,6 +3733,37 @@ async def anthropic_messages(request: Request):
             )
 
     req_model = body.get("model")
+    # P0-7: official passthrough for the Anthropic surface — the translated
+    # OpenAI-style messages and tools above go straight to the official API;
+    # the reply is re-shaped by the same format_anthropic_response the bridge
+    # uses, so the client-visible shape is identical. v1 keeps one upstream
+    # call shape: a streaming request is answered with correct Anthropic SSE
+    # built from the complete upstream answer.
+    if official_api.official_mode_enabled():
+        payload = {"model": official_api.map_model(model), "messages": openai_msgs}
+        if openai_tools:
+            payload["tools"] = openai_tools
+        try:
+            result = await official_api.official_chat(payload, stream=False)
+        except UpstreamError as e:
+            return _api_error_response(e, is_anthropic=True)
+        usage = result.get("usage") or {}
+        await _record_usage_safe(
+            get_api_key(request),
+            "official",
+            result.get("model") or payload["model"],
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+        )
+        if stream:
+            return StreamingResponse(
+                _official_anthropic_stream(result, req_model, usage),
+                media_type="text/event-stream",
+            )
+        if not isinstance(result, dict) or "choices" not in result:
+            return JSONResponse(result)
+        return format_anthropic_response(result, req_model)
+
     if stream:
         return await handle_chat(
             openai_msgs,
@@ -2447,11 +3793,129 @@ async def anthropic_messages(request: Request):
     return format_anthropic_response(result, req_model)
 
 
+def _official_anthropic_stream(result, req_model, usage):
+    """P0-7: Anthropic SSE built from a COMPLETE official chat completion.
+
+    v1 official mode keeps one upstream call shape (non-stream), so a client
+    that asked for streaming gets the correct Anthropic event sequence
+    (message_start -> content blocks -> message_delta -> message_stop) built
+    from the finished answer — byte-compatible with what
+    stream_anthropic_response emits for the bridge."""
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    model_name = req_model if req_model else SINGLE_MODEL
+    in_tokens = (usage or {}).get("prompt_tokens", 0)
+    out_tokens = (usage or {}).get("completion_tokens", 0)
+
+    def _evt(payload, event=None):
+        prefix = f"event: {event}\n" if event else ""
+        return f"{prefix}data: {json.dumps(payload)}\n\n"
+
+    async def _gen():
+        yield _evt(
+            {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model_name,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": in_tokens, "output_tokens": 1},
+                },
+            },
+            "message_start",
+        )
+        choice = (result.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        block_index = 0
+        text = message.get("content") or ""
+        if text:
+            yield _evt(
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                "content_block_start",
+            )
+            yield _evt(
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+                "content_block_delta",
+            )
+            yield _evt(
+                {"type": "content_block_stop", "index": block_index},
+                "content_block_stop",
+            )
+            block_index += 1
+        tool_calls = message.get("tool_calls") or []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            try:
+                tool_input = (
+                    json.loads(fn.get("arguments", "{}"))
+                    if isinstance(fn.get("arguments"), str)
+                    else (fn.get("arguments") or {})
+                )
+            except json.JSONDecodeError:
+                tool_input = {}
+            yield _evt(
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:16]}",
+                        "name": fn.get("name", ""),
+                        "input": {},
+                    },
+                },
+                "content_block_start",
+            )
+            yield _evt(
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(tool_input),
+                    },
+                },
+                "content_block_delta",
+            )
+            yield _evt(
+                {"type": "content_block_stop", "index": block_index},
+                "content_block_stop",
+            )
+            block_index += 1
+        stop_reason = "tool_use" if tool_calls else "end_turn"
+        yield _evt(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": out_tokens},
+            },
+            "message_delta",
+        )
+        yield _evt({"type": "message_stop"}, "message_stop")
+
+    return _gen()
+
+
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
+
+    # P0-7: official mode lists the official ids with their documented limits.
+    if official_api.official_mode_enabled():
+        return JSONResponse({"object": "list", "data": official_api.OFFICIAL_MODELS})
 
     # Declared limits reflect OBSERVED DeepSeek web behavior (issue #22), not
     # guaranteed upstream API limits: a single first message passes up to ~1M
@@ -2572,7 +4036,7 @@ async def logout(request: Request):
 
 
 def _safe_next(raw, default="/dashboard"):
-    """Sanitize a `next` redirect target: site-relative paths only.
+    r"""Sanitize a `next` redirect target: site-relative paths only.
 
     This is the open-redirect boundary. A caller-supplied `next` that is
     echoed into a Location/meta-refresh must not be able to send a logged-in
@@ -2635,8 +4099,16 @@ async def dashboard(request: Request):
     denied = webui.gate(request, get_current_admin)
     if denied:
         return denied
-    tokens = await _db(get_tokens)
-    return webui.render(request, "dashboard.html", tokens=tokens)
+    # P0-3: the pool view carries state, load and timers — and no credential
+    # field, so nothing secret can reach the page source.
+    tokens = await _db(get_pool_view)
+    # P0-6: last 30 days of usage, per day x per masked key. The aggregation
+    # returns ready-to-render rows (masked aliases + pricing-source note), the
+    # template computes nothing.
+    usage_rows = await _db(usage_by_day_key, time.time() - 30 * 86400)
+    return webui.render(
+        request, "dashboard.html", tokens=tokens, usage_rows=usage_rows
+    )
 
 
 @app.post("/tokens/add")
@@ -2661,6 +4133,17 @@ async def tokens_delete(token_id: int, request: Request):
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
+@app.post("/tokens/{token_id}/restore")
+async def tokens_restore(token_id: int, request: Request):
+    """P0-3: the manual return from quarantine — there is no other exit."""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    await _db(restore_token, token_id)
+    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     return await dashboard(request)
@@ -2680,10 +4163,37 @@ async def health(request: Request):
     # WAF cookies are deprecated in favor of Android headers (which do not require cookies).
     # Token presence determines service readiness; cookie status is kept for backup visibility.
     ok = active > 0
+    # P0-9 contract (PR #62 review fix, Low): an unauthenticated deep request
+    # is refused with 401 BEFORE any upstream traffic — the shallow check
+    # stays public, the deep probe can never work as a free relay tester.
+    # The ordering used to live only inside _deep_health_probe_guarded, which
+    # the route never called, so an unauthenticated ?deep=1 silently got the
+    # shallow 200 instead of the documented 401.
+    deep = (request.query_params.get("deep") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if deep and not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
     data = {"status": "ok" if ok else "degraded"}
     if check_key(request):
         data["active_tokens"] = active
         data["cookies_valid"] = cookies_valid
+        data["version"] = APP_VERSION
+
+        # P0-9 (Day 26): deep probe. Authenticated callers can ask for one
+        # real end-to-end upstream round trip (PoW challenge -> solve ->
+        # chat session create). The shallow check stays public; an
+        # unauthenticated deep request is refused above, BEFORE any upstream
+        # traffic, so the endpoint can never be abused as a free relay
+        # tester.
+        if deep:
+            probe = await _deep_health_probe()
+            data["deep"] = probe
+            if probe.get("upstream_reachable") is not True:
+                data["status"] = "degraded"
+                ok = False
     return JSONResponse(data, status_code=200 if ok else 503)
 
 
@@ -2730,6 +4240,69 @@ async def audit_rate_limits(request: Request, since: float = None):
         logger.exception("audit rate-limit summary failed")
         return JSONResponse({"error": "audit store unavailable"}, status_code=503)
     return JSONResponse({"tokens": rows, "enabled": audit.enabled()})
+async def _deep_health_probe_guarded(authorized):
+    """Deep probe entry shared by the route and tests (P0-9).
+
+    An unauthorized caller gets the 401 BEFORE any upstream call is made —
+    the ordering is the security property, so it lives in one place."""
+    if not authorized:
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    probe = await _deep_health_probe()
+    ok = probe.get("upstream_reachable") is True
+    return JSONResponse(
+        {"status": "ok" if ok else "degraded", "deep": probe},
+        status_code=200 if ok else 503,
+    )
+
+
+async def _deep_health_probe():
+    """One end-to-end upstream round trip including PoW (P0-9).
+
+    Cost: one empty upstream chat per call — the cheapest honest probe this
+    bridge can run, because chat session create is exactly the hop that
+    breaks when PoW, the client version or the token dies. The probe never
+    sends a message and never reports token material, only shapes.
+
+    State-aware pick (PR #62 review fix, Medium): the probe rides
+    pick_token(), which skips QUARANTINED rows and still-cooling
+    RATE_LIMITED rows. The old get_auth_token() grabbed literally the first
+    row in the table, so the probe both reported degraded while healthy
+    tokens existed (false negative) and deliberately sent upstream traffic
+    into a known-dead credential — the exact re-arming behavior P0-3 exists
+    to prevent.
+    """
+    token_id = await _db(pick_token)
+    row = await _db(get_token, token_id) if token_id is not None else None
+    auth_token = row["token"] if row else None
+    if not auth_token:
+        return {
+            "upstream_reachable": False,
+            "pow_ok": False,
+            "latency_ms": None,
+            "reason": "no ACTIVE token in pool",
+        }
+    started = time.perf_counter()
+    try:
+        chat_id = await create_new_chat(auth_token)
+    except Exception as e:
+        logger.warning("Deep health probe failed: %s", e)
+        return {
+            "upstream_reachable": False,
+            "pow_ok": False,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            # upstream-derived text never reaches the body: only the typed
+            # status via the redaction used for error envelopes
+            "reason": _redact_secret_material(str(e))[:200] or "upstream error",
+        }
+    latency_ms = round((time.perf_counter() - started) * 1000, 1)
+    return {
+        "upstream_reachable": True,
+        "pow_ok": True,
+        "latency_ms": latency_ms,
+        # the created session id is upstream account material — report only
+        # that it exists, never the id itself
+        "chat_created": bool(chat_id),
+    }
 
 
 def main():

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import contextvars
 import json
 import logging
 import mimetypes
@@ -172,6 +173,12 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN rate_limited_until REAL")
     if "last_used" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
+    # P0-3 migration: how many 403s this token has seen with no successful
+    # turn in between. Reset by mark_active() and by restore_token().
+    if "consecutive_403" not in existing_cols:
+        conn.execute(
+            "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
+        )
     existing_session_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
     }
@@ -185,6 +192,26 @@ def init_db():
         audit.init_audit_db(conn)
     except Exception:
         logger.exception("Audit store init failed (non-fatal)")
+    # P0-6 (Day 29): usage stats — one row per COMPLETED turn (client-visible
+    # success), aggregated per day x per masked key at read time. Keeping raw
+    # rows instead of pre-aggregated counters makes the numbers auditable and
+    # the "streamed retries count once" rule structural: a failed attempt has
+    # nothing to record.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            day TEXT NOT NULL,
+            key_alias TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            model TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_day_key ON usage(day, key_alias)"
+    )
     conn.commit()
     conn.close()
     try:
@@ -588,10 +615,19 @@ def delete_token(token_id):
 #   * a soft per-token concurrency cap: capped tokens are only used when
 #     nothing else is free,
 #   * a soonest-to-recover fallback when every token is still cooling down.
+#
+# P0-3 adds the third state on top of this scheduler: QUARANTINED. Selection
+# logic below is untouched — a quarantined token is simply never a candidate.
 # ==============================================================================
 
 TOKEN_COOLDOWN_SECONDS = max(1, int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60")))
 TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8")))
+
+# P0-3: a 403 seen this many times in a row (no successful turn in between) is
+# not a transient refusal — it is the ban ladder, so the token leaves rotation
+# until an operator restores it. 0 disables escalation and keeps today's
+# cooldown-everything behavior; a 401 quarantines unconditionally.
+QUARANTINE_AFTER_403 = max(0, int(os.getenv("DEEPSEEKER_QUARANTINE_AFTER_403", "3")))
 
 # Per-token in-flight refcounts (per process; single event-loop worker). Every
 # send reserves one slot via acquire_token_slot() and releases it when the
@@ -643,6 +679,10 @@ def pick_token(exclude=None):
     `exclude` (optional, B10) lists token ids the caller just saw fail: they
     are avoided while ANY other token is available, so an empty-SSE retry
     cannot land on the same poisoned token.
+
+    QUARANTINED tokens (P0-3) are never a candidate here, not even through the
+    all-cooling fallback: a token rejected on auth would otherwise be handed
+    straight back to the caller as the "soonest to recover" one.
     """
     now = time.time()
     conn = get_db()
@@ -657,6 +697,8 @@ def pick_token(exclude=None):
     available = []
     recovered = []
     for tid, status, until, last_used in rows:
+        if status == "QUARANTINED":
+            continue  # terminal: only restore_token() puts it back (P0-3)
         if status == "RATE_LIMITED" and until is not None and until > now:
             continue  # still cooling down
         if status == "RATE_LIMITED":
@@ -690,23 +732,95 @@ def pick_token(exclude=None):
 
     # Every token is rate-limited and still cooling: pick the one that
     # recovers first (bounded wait) instead of stampeding onto the lowest id
-    # with no backoff at all.
+    # with no backoff at all. Quarantined rows stay out of the race — with a
+    # pool of nothing but dead credentials this returns None, and the callers
+    # already treat "no token" as the not-configured case.
     conn = get_db()
     row = conn.execute(
-        "SELECT id FROM tokens ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
+        "SELECT id FROM tokens WHERE status != 'QUARANTINED' "
+        "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
     ).fetchone()
     conn.close()
     return row[0] if row else None
 
 
-def mark_limited(token_id, reason=None, **audit_fields):
-    """Mark a token RATE_LIMITED and audit the trigger.
+def mark_quarantined(token_id, reason):
+    """Take a token out of rotation until an operator restores it (P0-3).
 
-    The single funnel for every upstream rate-limit signal, so this is where
-    the `rate_limit` audit event is emitted. `reason` distinguishes WHICH
-    signal fired: http_429 / http_403 / http_401 / sse_rate_limit. Any extra
-    keyword is forwarded to audit.record (upstream_status, session_id, ...).
+    Unlike RATE_LIMITED there is no timer on this state: rate_limited_until is
+    cleared so pick_token()'s auto-recovery can never mistake a quarantined row
+    for a cooled-down one. The reason is logged for whoever is watching the
+    pool.
     """
+    logger.warning(
+        "Token #%d QUARANTINED (manual return required): %s", token_id, reason
+    )
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL WHERE id = ?",
+        ("QUARANTINED", token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def restore_token(token_id):
+    """The only exit from quarantine (P0-3): an explicit operator action.
+
+    last_used is deliberately left alone, so a restored token carries the
+    oldest usage stamp and the landed idle-oldest tie-break eases it back into
+    rotation instead of dumping a burst onto it.
+    """
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
+        "consecutive_403 = 0 WHERE id = ?",
+        ("ACTIVE", token_id),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Token #%d restored to ACTIVE by operator", token_id)
+
+
+def _bump_403_streak(token_id):
+    """Increment and return this token's consecutive-403 counter."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET consecutive_403 = consecutive_403 + 1 WHERE id = ?",
+        (token_id,),
+    )
+    row = conn.execute(
+        "SELECT consecutive_403 FROM tokens WHERE id = ?", (token_id,)
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    return row[0] if row else 0
+
+
+def mark_limited(token_id, code=None, reason=None, **audit_fields):
+    """Record an upstream failure against a token — the pool's one door.
+
+    Without `code` this is exactly the landed B3 behavior: a RATE_LIMITED
+    cooldown that recovers by itself. With the upstream status (P0-3):
+
+      * 401 -> QUARANTINED immediately. A rejected credential is never
+        transient, and cooling it for 60s just re-arms the same dead account.
+      * 403 -> cooldown as today, plus QUARANTINED once QUARANTINE_AFTER_403
+        consecutive 403s pile up with no successful turn in between.
+      * anything else (429) -> cooldown, as landed.
+    """
+    if code == 401:
+        mark_quarantined(token_id, "upstream 401 (auth rejected)")
+        return
+    if code == 403:
+        streak = _bump_403_streak(token_id)
+        threshold = QUARANTINE_AFTER_403
+        if threshold and streak >= threshold:
+            mark_quarantined(
+                token_id,
+                f"{streak} consecutive upstream 403s (threshold {threshold})",
+            )
+            return
     until = time.time() + TOKEN_COOLDOWN_SECONDS
     logger.warning(
         "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
@@ -724,13 +838,184 @@ def mark_limited(token_id, reason=None, **audit_fields):
 
 
 def mark_active(token_id):
+    """Stamp a successful turn: back in rotation, streak cleared.
+
+    A QUARANTINED row is deliberately left alone (P0-3). Requests overlap, so a
+    send that started before the pull can land its success afterwards; letting
+    that flip the status would let a stale response launder an operator-
+    controlled state, and only restore_token() ends a quarantine.
+    """
     conn = get_db()
     conn.execute(
-        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ? WHERE id = ?",
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ?, "
+        "consecutive_403 = 0 WHERE id = ? AND status != 'QUARANTINED'",
         ("ACTIVE", time.time(), token_id),
     )
     conn.commit()
     conn.close()
+
+
+def _format_span(seconds):
+    """Compact elapsed time for the pool view: 42s, 7m, 3h, 2d."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+# ==============================================================================
+# P0-6 (Days 28-30) — usage stats
+#
+# One row per COMPLETED turn (the client saw a real answer). Failed attempts
+# record nothing, so a turn retried across the pool lands exactly once — the
+# counting rule is structural, not a dedup heuristic. Tokens are billed on the
+# CLEANED completion (B7 semantics) by the callers, matching the usage chunk
+# clients already receive. Cost is derived from the flat tariff table and is
+# labeled as such everywhere it renders: it is an estimate against the shipped
+# rates, not upstream metering.
+# ==============================================================================
+
+
+def mask_api_key(key):
+    """Masked key alias for display: last 4 characters only.
+
+    The dashboard and every aggregate render this — a screenshot of the page
+    must not carry usable key material. Short keys (<= 8 chars, e.g. someone's
+    one-word key) are fully masked."""
+    key = str(key or "").strip()
+    if not key:
+        return "unknown"
+    if len(key) <= 8:
+        return "…"
+    return "…" + key[-4:]
+
+
+def record_usage(key_alias, surface, model, in_tokens, out_tokens, ts=None):
+    """Record one completed turn. `key_alias` is expected PRE-MASKED — pass
+    mask_api_key(raw_key) at the call site; this function never stores raw
+    key material as a defense against future callers forgetting."""
+    alias = (
+        mask_api_key(key_alias)
+        if key_alias and not str(key_alias).startswith("…")
+        else str(key_alias or "unknown")
+    )
+    when = time.time() if ts is None else float(ts)
+    day = time.strftime("%Y-%m-%d", time.gmtime(when))
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO usage (ts, day, key_alias, surface, model, input_tokens, output_tokens) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            when,
+            day,
+            alias,
+            str(surface or "unknown"),
+            str(model or ""),
+            max(0, int(in_tokens or 0)),
+            max(0, int(out_tokens or 0)),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def usage_by_day_key(since_ts=0.0):
+    """Aggregate usage per day x per masked key alias.
+
+    Returns ready-to-render rows (day, key, surfaces, requests, input_tokens,
+    output_tokens, cost, pricing_source) — the template computes nothing, the
+    same rule the pool view follows. An empty store is an empty list, never an
+    error; an unused key simply has no rows for that day. Performance: the
+    (day, key_alias) index covers the GROUP BY, so a month of data stays a
+    few milliseconds of SQLite work — no pre-aggregation table needed."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT day, key_alias, "
+        "GROUP_CONCAT(DISTINCT surface), COUNT(*), "
+        "SUM(input_tokens), SUM(output_tokens) "
+        "FROM usage WHERE ts >= ? "
+        "GROUP BY day, key_alias ORDER BY day DESC, key_alias ASC",
+        (float(since_ts or 0.0),),
+    ).fetchall()
+    conn.close()
+
+    tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
+    out = []
+    for day, alias, surfaces, requests, in_tok, out_tok in rows:
+        in_tok = in_tok or 0
+        out_tok = out_tok or 0
+        cost = (in_tok / 1_000_000 * tariff["cache_miss_input"]) + (
+            out_tok / 1_000_000 * tariff["output_generation"]
+        )
+        out.append(
+            {
+                "day": day,
+                "key": alias,
+                "surfaces": surfaces or "unknown",
+                "requests": requests,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cost": round(cost, 6),
+                "pricing_source": "flat tariff table (not metered upstream usage)",
+            }
+        )
+    return out
+
+
+def get_pool_view():
+    """Per-token operator view of the pool (P0-3).
+
+    State, load and timers as ready-to-render strings, and no credential field
+    at all: the token column is deliberately absent, because this output goes
+    straight into HTML a browser caches and a screenshot carries away.
+    Formatting happens here so templates/dashboard.html renders state without
+    computing any — a template that computes is one that can grow a secret.
+    """
+    now = time.time()
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403 "
+        "FROM tokens ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    view = []
+    for tid, alias, status, until, last_used, streak in rows:
+        streak = streak or 0
+        if status == "QUARANTINED":
+            state_class, cooldown = "err", "—"
+            note = "quarantined — manual return required"
+        elif status == "RATE_LIMITED" and until and until > now:
+            state_class = "warn"
+            cooldown = f"{_format_span(until - now)} left"
+            note = "cooling down, recovers automatically"
+        elif status == "RATE_LIMITED":
+            state_class, cooldown = "warn", "expired"
+            note = "rejoins rotation on the next pick"
+        else:
+            state_class, cooldown = "ok", "—"
+            note = "in rotation"
+        if streak and status != "QUARANTINED":
+            note = f"{note}, 403 streak {streak}"
+        age = "never" if not last_used else f"{_format_span(now - last_used)} ago"
+        view.append(
+            {
+                "id": tid,
+                "label": alias if alias else f"untagged #{tid}",
+                "status": status,
+                "state_class": state_class,
+                "state_note": note,
+                "in_flight": _in_flight.get(tid, 0),
+                "last_used": age,
+                "cooldown": cooldown,
+                "can_restore": status == "QUARANTINED",
+            }
+        )
+    return view
 
 
 def find_session(sig):
@@ -1050,6 +1335,118 @@ def tool_block_is_truncated(text):
     return not _payload_is_complete(text[opens[-1].end() :])
 
 
+# Openers may come as "</｜｜DSML｜｜ parameter name=...>" (the model mixes up
+# open/close), as 'parameter="x"' without name, or without "parameter name=" at all
+# ('<｜｜DSML｜｜command" string=...>', '<｜｜DSML｜｜ old_string="true">') ("<｜｜DSML｜｜command" string=...>),
+# and a value ends at the proper closer, the next parameter, or ANY DSML marker
+# (bare "</｜｜DSML｜｜>", truncated "</｜｜DSML｜｜ ", "</｜｜DSML｜｜ calls>",
+# "<"-less "｜｜DSML｜｜parameter>"): markers never belong in a value.
+_DSML_PARAM_RE = re.compile(
+    r"(?:</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)(?:\s+name\s*=|\s*=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]"
+    r"|</?[｜\|]{1,2}DSML[｜\|]{1,2}\s*(?!(?:parameter|invoke|function_calls?|tool_calls?|calls)\b)([A-Za-z_][\w\-]*)(?=[\x27\x22]|\s*=\s*[\x27\x22](?:true|false)[\x27\x22]))([^>]*)>"
+    r"(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|(?=(?:</?)?[｜\|]{1,2}DSML|</?[｜\|]{0,2}DSML[｜\|])|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _dsml_params(body):
+    args = {}
+    for pm in _DSML_PARAM_RE.finditer(body):
+        p_name = (pm.group(1) or pm.group(2)).strip()
+        p_val = pm.group(4).strip()
+        p_val = re.sub(
+            r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
+            "",
+            p_val,
+            flags=re.IGNORECASE,
+        ).strip()
+        # string="true" marks a literal string; don't turn "42"/"true" into JSON.
+        # ('<｜｜DSML｜｜old_string="true">' puts the type right after the name.)
+        if re.search(r"(?:string\s*=|^\s*=)\s*[\x27\x22]true", pm.group(3), re.IGNORECASE):
+            args[p_name] = p_val
+            continue
+        try:
+            args[p_name] = json.loads(p_val)
+        except Exception:
+            args[p_name] = p_val
+    return args
+
+
+# The request's tool list, set by handle_chat, so parse_tools can recover a call
+# whose tool name the model dropped (a function_calls block without an invoke).
+request_tools = contextvars.ContextVar("request_tools", default=None)
+
+
+def _tool_schemas():
+    schemas = {}
+    for t in request_tools.get() or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name")
+        params = fn.get("parameters") or fn.get("input_schema") or {}
+        if name and isinstance(params, dict):
+            schemas[name] = params
+    return schemas
+
+
+def _infer_tool_name(args, schemas):
+    """The one tool whose schema accepts exactly these argument names."""
+    # First require every required field; if the model also dropped one of those,
+    # still name the one tool that accepts these arguments, so the client reports
+    # the missing field instead of an unknown tool.
+    for need_required in (True, False):
+        fits = []
+        for name, params in schemas.items():
+            props = set(params.get("properties") or {})
+            required = set(params.get("required") or [])
+            if set(args) <= props and (not need_required or required <= set(args)):
+                fits.append((len(props - set(args)), name))
+        fits.sort()
+        if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
+            return fits[0][1]
+    return None
+
+
+def _repair_tool_names(tools):
+    schemas = _tool_schemas()
+    if not schemas:
+        return tools
+    for t in tools:
+        fn = t["function"]
+        if fn["name"] in schemas:
+            continue
+        try:
+            args = json.loads(fn["arguments"])
+        except Exception:
+            continue
+        if isinstance(args, dict):
+            fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
+    return tools
+
+
+
+
+# The request's reasoning effort ("high", "max", ...) when thinking is on, set by
+# the chat endpoints; build_prompt turns it into a think-harder instruction.
+request_effort = contextvars.ContextVar("request_effort", default=None)
+
+
+def effort_level(body):
+    """The client's effort string, wherever the dialect puts it."""
+    cands = [body.get("reasoning_effort"), body.get("effort")]
+    for key in ("reasoning", "output_config", "thinking"):
+        v = body.get(key)
+        if isinstance(v, dict):
+            cands += [v.get("effort"), v.get("reasoning_effort"), v.get("level")]
+        elif key == "thinking" and isinstance(v, str):
+            cands.append(v)
+    for c in cands:
+        if isinstance(c, str) and c.strip():
+            return c.strip().lower()
+    return None
+
+
 def parse_tools(text):
     tools = []
     clean_text = text
@@ -1073,44 +1470,51 @@ def parse_tools(text):
         "url",
         "input",
     }
-    tool_matches = list(
-        re.finditer(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
+    # Call starts: invoke openers (also "</…invoke name=…>", the model mixes up
+    # open/close), DSML function_calls blocks with no invoke at all, and a bare
+    # "<｜｜DSML｜｜invoke>" without a name; their tool name is inferred from the
+    # parameters.
+    starts = [
+        (m, m.group(1).strip())
+        for m in re.finditer(
+            r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)(?:\s+(?:name|tool)\s*=|\s*=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
             text,
             re.IGNORECASE,
         )
+    ] + [
+        (m, None)
+        for m in re.finditer(
+            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*(?:function_calls?|tool_calls?|calls|invoke)\s*>",
+            text,
+            re.IGNORECASE,
+        )
+    ]
+    real_tool_matches = sorted(
+        (st for st in starts if not fenced(st[0].start())), key=lambda st: st[0].start()
     )
-    real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
-        for i, tm in enumerate(real_tool_matches):
-            candidate_name = tm.group(1).strip()
+        schemas = _tool_schemas()
+        for i, (tm, candidate_name) in enumerate(real_tool_matches):
             start_idx = tm.end()
+            # 'invoke name="i" string="true">…': the model fused the invoke with its
+            # first parameter; read it as a parameter and infer the tool name.
+            if (
+                candidate_name
+                and "string=" in tm.group(0)
+                and schemas
+                and candidate_name not in schemas
+            ):
+                start_idx = tm.start()
+                candidate_name = None
             end_idx = (
-                real_tool_matches[i + 1].start()
+                real_tool_matches[i + 1][0].start()
                 if i + 1 < len(real_tool_matches)
                 else len(text)
             )
             body = text[start_idx:end_idx]
             args = {}
-            p_matches = re.finditer(
-                r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=))",
-                body,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-            for pm in p_matches:
-                p_name = pm.group(1).strip()
-                p_val = pm.group(2).strip()
-                p_val = re.sub(
-                    r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
-                    "",
-                    p_val,
-                    flags=re.IGNORECASE,
-                ).strip()
-                try:
-                    args[p_name] = json.loads(p_val)
-                except Exception:
-                    args[p_name] = p_val
+            args = _dsml_params(body)
             tag_param_matches = re.finditer(
                 r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)",
                 body,
@@ -1133,10 +1537,11 @@ def parse_tools(text):
             # [FIX 2] The trailing block of a cut-off stream is a partial
             # call: its visible args are a prefix, not the real ones. Drop
             # it instead of emitting a tool_use the client cannot satisfy.
-            if candidate_name and not (
+            # A wrapper with no name of its own falls back to "function_calls".
+            if (candidate_name or args) and not (
                 truncated and i == len(real_tool_matches) - 1
             ):
-                norm = normalize_tool_call(candidate_name, args)
+                norm = normalize_tool_call(candidate_name or "function_calls", args)
                 if norm:
                     tools.append(norm)
 
@@ -1412,6 +1817,7 @@ def parse_tools(text):
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = _strip_wrapper_tags(clean_text).strip()
+    tools = _repair_tool_names(tools)
     return tools, clean_text
 
 
@@ -1448,8 +1854,10 @@ _ORPHAN_CLOSER_RE = re.compile(
 # streamed to the client as literal text. Note the tag-name slot is required to
 # be EMPTY: "<｜｜DSML｜｜ invoke ...>" does not match and is left for the entry
 # regex.
+# The ">" is optional: the model also leaks truncated markers like
+# "<｜｜DSML｜｜ </｜｜DSML｜｜ " as prose.
 _BARE_DSML_MARKER_RE = re.compile(
-    r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*>",
+    r"</?[｜\|]{0,2}DSML[｜\|]{0,2}+\s*+(?![A-Za-z_])[>＞]?",
     re.IGNORECASE,
 )
 
@@ -1809,10 +2217,48 @@ _EMPTY_SSE_CONTEXT = (
     "Empty response from DeepSeek (prompt may exceed the session context limit)"
 )
 _CONTEXT_LIMIT_HINT_RE = re.compile(
-    r"context|token.?limit|maximum.?context|too.?long|exceed",
+    r"maximum.?context"
+    r"|context.?(?:length|limit|window)"
+    r"|token.?limit"
+    r"|(?:prompt|payload|conversation|messages?).{0,24}too.?long"
+    r"|exceed(?:ed|s)?[^.\n]{0,30}context",
     re.IGNORECASE,
 )
 _SSE_RECENT_LINES = 8
+
+
+def is_context_limit_error(exc):
+    """Public classifier (DSH fix): did this failure come from the upstream
+    session running out of context?
+
+    Agent harnesses die here: a context-class failure used to be retried
+    verbatim on other tokens (the context belongs to the CHAT, not the token,
+    so every attempt fails the same way) and finally surfaced to the client as
+    a context-limit error. The caller uses this to trigger a summary rollover
+    instead. Matches:
+      * UpstreamError bodies carrying upstream context wording (HTTP 400
+        'maximum context length', 'context limit', 'too long', ...), and
+      * the bridge's own empty-SSE-with-context-hint error.
+    Deliberately NOT matched: generic 5xx/timeouts — 'deadline exceeded' or
+    '502 upstream timeout' are retry-shaped, not context-shaped. The loose
+    words only count when anchored to context material: a bare 'exceed' or a
+    'too long' with no prompt/message in front of it no longer classifies as
+    context (review fix, PR #67 — an upstream body like 'header limit
+    exceeded' for a non-context reason used to force a wasteful summary
+    rollover), and the plain-exception fallback requires explicit context-
+    limit phrasing — a mere 'context' substring ('context deadline
+    exceeded') is retry-shaped, not context-shaped."""
+    if isinstance(exc, UpstreamError):
+        body = exc.body or ""
+        return bool(_CONTEXT_LIMIT_HINT_RE.search(body))
+    text = str(exc or "")
+    return bool(
+        re.search(
+            r"maximum.?context|context.?(?:length|limit|window)|token.?limit",
+            text,
+            re.IGNORECASE,
+        )
+    )
 
 
 class _SseStreamFinished(Exception):
@@ -1891,7 +2337,54 @@ def _raise_sse_error_event(data, recent_lines):
     raise UpstreamError(502, content, origin="sse")
 
 
-async def send_message(
+# DeepSeek generates one message per account at a time; a second concurrent send
+# fails with "A message is being generated" / "Messages too frequent". Queue sends
+# per token instead. Every generation goes through send_message, so this covers all
+# callers.
+_send_locks = {}
+
+
+def token_busy(auth_token):
+    """True while this account is generating (its send lock is held)."""
+    lock = _send_locks.get(auth_token)
+    return bool(lock and lock.locked())
+
+
+async def send_message(chat_id, auth_token, *args, **kwargs):
+    # The upstream stream is drained by its own task, so the lock is released when
+    # DeepSeek finishes even if the consumer abandons this generator mid-stream
+    # (client gone without aclose): holding it across our yields leaked the lock
+    # and wedged every later request on that account.
+    lock = _send_locks.setdefault(auth_token, asyncio.Lock())
+    queue = asyncio.Queue()
+    done = object()
+
+    async def pump():
+        try:
+            async with lock:
+                gen = _send_message_unlocked(chat_id, auth_token, *args, **kwargs)
+                try:
+                    async for chunk in gen:
+                        queue.put_nowait(chunk)
+                finally:
+                    await gen.aclose()
+        except Exception as e:
+            queue.put_nowait(e)
+        finally:
+            queue.put_nowait(done)
+
+    task = asyncio.create_task(pump())
+    try:
+        while (item := await queue.get()) is not done:
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        # A consumer that closes us (disconnect, abort) still cancels the upstream.
+        task.cancel()
+
+
+async def _send_message_unlocked(
     chat_id,
     auth_token,
     message,
@@ -1923,6 +2416,11 @@ async def send_message(
 
     think_open = False
     got_output = False
+    # DeepSeek ends a reply it cut short (seen mid-thinking on long contexts) with
+    # status INCOMPLETE. With no answer text yet that is a failed turn, not a
+    # finished one: an empty "stop" makes agent clients end the turn.
+    incomplete = False
+    got_response = False
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers,
@@ -1944,8 +2442,14 @@ async def send_message(
         parsed_events = []
         line_buf = b""
 
+        def _check_incomplete():
+            if incomplete and not got_response:
+                raise UpstreamError(
+                    502, "DeepSeek stopped the reply before any answer (status INCOMPLETE)"
+                )
+
         async def _emit_from_event(data):
-            nonlocal think_open, got_output
+            nonlocal think_open, got_output, incomplete, got_response
             if isinstance(data, dict) and data.get("type") == "error":
                 _raise_sse_error_event(data, recent_lines)
 
@@ -1953,15 +2457,29 @@ async def send_message(
                 for op in data["v"]:
                     if not isinstance(op, dict):
                         continue
-                    if op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
-                        continue
+                    if op.get("p") == "quasi_status":
+                        incomplete = incomplete or op.get("v") == "INCOMPLETE"
+                        continue  # a status word, never content
                     async for chunk in _emit_from_event(op):
                         yield chunk
+                return
+
+            # Any other status field ("response/status", ".../status") carries a
+            # status word such as INCOMPLETE or WIP, never content.
+            p_name, p_val = str(data.get("p") or ""), data.get("v")
+            if (
+                p_name.endswith("status")
+                and isinstance(p_val, str)
+                and p_val.isupper()
+                and p_val != "FINISHED"
+            ):
+                incomplete = incomplete or p_val == "INCOMPLETE"
                 return
 
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
                 if think_open:
                     yield "\n</think>\n\n"
+                _check_incomplete()
                 if not got_output:
                     _raise_empty_sse_response(recent_lines, parsed_events)
                 raise _SseStreamFinished()
@@ -1981,6 +2499,7 @@ async def send_message(
                                 yield "\n</think>\n\n"
                                 think_open = False
                             got_output = True
+                            got_response = got_response or bool(fragment.get("content"))
                             yield fragment.get("content", "")
                 return
 
@@ -1993,6 +2512,7 @@ async def send_message(
                                 yield "\n</think>\n\n"
                                 think_open = False
                             got_output = True
+                            got_response = got_response or bool(fragment.get("content"))
                             yield fragment.get("content", "")
                         elif fragment.get("type") == "THINK":
                             if not think_open:
@@ -2008,6 +2528,7 @@ async def send_message(
             v = data.get("v")
             if isinstance(v, str) and v:
                 got_output = True
+                got_response = got_response or not think_open
                 yield v
 
         async def _consume_sse_line(decoded_line: str):
@@ -2054,6 +2575,7 @@ async def send_message(
 
         if think_open:
             yield "\n</think>\n\n"
+        _check_incomplete()
         if not got_output:
             _raise_empty_sse_response(recent_lines, parsed_events)
 

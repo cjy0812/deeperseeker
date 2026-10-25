@@ -57,13 +57,34 @@ STRINGS = [
     ("dashboard.th_alias", "Alias", "别名"),
     ("dashboard.th_token", "Token", "Token"),
     ("dashboard.th_status", "Status", "状态"),
+    ("dashboard.th_in_flight", "In-flight", "进行中"),
+    ("dashboard.th_last_used", "Last used", "最近使用"),
+    ("dashboard.th_cooldown", "Cooldown", "冷却剩余"),
     ("dashboard.th_actions", "Actions", "操作"),
     ("dashboard.delete", "Delete", "删除"),
     ("dashboard.delete_confirm", "Delete this token?", "确认删除这个 token？"),
+    ("dashboard.restore", "Restore", "恢复"),
     ("dashboard.api", "API", "API"),
     ("dashboard.api_openai", "OpenAI-compatible base URL:", "OpenAI 兼容地址："),
     ("dashboard.api_anthropic", "Anthropic-compatible base URL:", "Anthropic 兼容地址："),
     ("dashboard.api_model", "Model:", "模型："),
+
+    # Token lifecycle states. The stored value stays the raw English enum
+    # (webui._STATUS_KEYS maps it to these keys); only the visible text is
+    # translated. QUARANTINED has no entry on purpose -- it is echoed verbatim.
+    ("dashboard.status_active", "Active", "进行中"),
+    ("dashboard.status_rate_limited", "Rate limited", "限流中"),
+
+    ("dashboard.usage", "Usage", "用量"),
+    ("dashboard.usage_day", "Day", "日期"),
+    ("dashboard.usage_key", "Key", "密钥"),
+    ("dashboard.usage_surfaces", "Surfaces", "入口"),
+    ("dashboard.usage_requests", "Requests", "请求数"),
+    ("dashboard.usage_input", "Input tokens", "输入 token"),
+    ("dashboard.usage_output", "Output tokens", "输出 token"),
+    ("dashboard.usage_cost", "Cost", "费用"),
+    ("dashboard.usage_note", "Last 30 days. Key aliases are masked; cost follows the configured pricing source.", "最近 30 天。密钥别名已脱敏；费用按当前配置的价格来源计算。"),
+    ("dashboard.usage_empty", "No usage recorded in the last 30 days.", "最近 30 天没有用量记录。"),
 
     ("audit.title", "Audit", "审计"),
     ("audit.heading", "Audit", "审计"),
