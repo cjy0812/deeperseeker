@@ -216,6 +216,46 @@ def _dsml_params(body):
     return args
 
 
+_JSON_NAME_KEYS = ("name", "tool", "tool_name", "function", "action")
+_JSON_ARG_KEYS = (
+    "arguments",
+    "parameters",
+    "input",
+    "args",
+    "params",
+    "tool_input",
+    "action_input",
+)
+
+
+def _json_body_call(body):
+    """Recover (name, args) from a JSON payload that stood in for parameter tags.
+
+    The model sometimes wraps a JSON tool call in the DSML wrapper instead of
+    emitting ``parameter`` tags. ``_DSML_PARAM_RE`` only understands tags, so
+    the arguments were dropped and the call went out as ``{}`` -- which the
+    client reports as "required parameter missing". Returns ``(None, None)``
+    when no JSON object can be decoded, so a cut payload still falls through
+    to the truncation rule instead of being half-emitted.
+    """
+    brace = body.find("{")
+    if brace == -1:
+        return None, None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(body[brace:])
+    except ValueError:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    name = next((data[k] for k in _JSON_NAME_KEYS if isinstance(data.get(k), str)), None)
+    args = next((data[k] for k in _JSON_ARG_KEYS if data.get(k) is not None), None)
+    if args is None:
+        args = {k: v for k, v in data.items() if k not in _JSON_NAME_KEYS}
+    if not isinstance(args, (dict, list)):
+        return None, None
+    return name, args
+
+
 # The request's tool list, set by handle_chat, so parse_tools can recover a call
 # whose tool name the model dropped (a function_calls block without an invoke).
 request_tools = contextvars.ContextVar("request_tools", default=None)
@@ -379,8 +419,17 @@ def parse_tools(text):
                 else len(text)
             )
             body = text[start_idx:end_idx]
-            args = {}
             args = _dsml_params(body)
+            # The model sometimes wraps a JSON call in the DSML wrapper instead
+            # of emitting ``parameter`` tags. _dsml_params only understands
+            # tags, so those args were dropped and the call went out as {},
+            # which the client reports as "required parameter missing".
+            if not args:
+                json_name, json_args = _json_body_call(body)
+                if json_args is not None:
+                    args = json_args
+                    if not candidate_name and json_name:
+                        candidate_name = json_name
             tag_param_matches = re.finditer(
                 r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)",
                 body,

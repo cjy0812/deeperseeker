@@ -333,3 +333,25 @@ def test_residue_emptying_required_field_drops_call():
         assert tools == []
     finally:
         request_tools.reset(token)
+
+
+def test_json_body_inside_dsml_wrapper_keeps_args():
+    """A JSON payload standing in for parameter tags must not be dropped.
+
+    Seen live as 221 calls that went out with ``input: {}``: the DSML wrapper
+    entered the tag branch, the JSON body matched no parameter tag, and the
+    empty args were then renamed to the narrowest schema.
+    """
+    token = request_tools.set(TOOLS)
+    try:
+        text = (
+            f'<{B}invoke name="bash">\n'
+            '{"command": "ls -la"}\n'
+            f'</{B}invoke>'
+        )
+        tools, _ = parse_tools(text)
+        assert [json.loads(t["function"]["arguments"]) for t in tools] == [
+            {"command": "ls -la"}
+        ]
+    finally:
+        request_tools.reset(token)
