@@ -257,3 +257,32 @@ def test_bare_invoke_without_name_is_inferred():
         ]
     finally:
         request_tools.reset(token)
+
+
+def test_unknown_tool_name_dropped_when_schemas_known():
+    """A call whose name fits no request tool is dropped, not forwarded.
+
+    Seen live as "No such tool available: function_calls" (179x in the
+    archives): the model dropped the name, prose got scraped into args, and
+    the "function_calls" fallback named nothing the client has.
+    """
+    token = request_tools.set(TOOLS)
+    try:
+        text = (
+            f'<{B}invoke name="bogus_tool">\n'
+            f'<{B}parameter name="x" string="true">1</{B}parameter>\n</{B}invoke>'
+        )
+        tools, _ = parse_tools(text)
+        assert tools == []
+    finally:
+        request_tools.reset(token)
+
+
+def test_unknown_tool_name_kept_without_schemas():
+    """Empty schemas (CLI / no request_tools) must not filter anything."""
+    text = (
+        f'<{B}invoke name="bogus_tool">\n'
+        f'<{B}parameter name="x" string="true">1</{B}parameter>\n</{B}invoke>'
+    )
+    tools, _ = parse_tools(text)
+    assert [t["function"]["name"] for t in tools] == ["bogus_tool"]

@@ -266,7 +266,11 @@ def _repair_tool_names(tools):
             continue
         if isinstance(args, dict):
             fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
-    return tools
+    # A name that still is not in the request's tool list names nothing the
+    # client has ("No such tool available: function_calls"); dropping the call
+    # beats forwarding one that cannot succeed. Empty schemas return above, so
+    # the schema-less CLI and test paths are unchanged.
+    return [t for t in tools if t["function"]["name"] in schemas]
 
 
 
