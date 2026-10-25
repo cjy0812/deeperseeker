@@ -154,10 +154,14 @@ DSML / XML / JSON 解析   dsml.StreamToolParser 或 dsml.parse_tools()
   用声明的 schema 修复模型编造的工具名，返回 `(clean_text, tool_calls)`。
 * `dsml.StreamToolParser` 处理增量块：只缓冲到足以判断某个前缀是否可能成立（`_is_plausible_stream_entry_prefix`），
   因此跨网络分片被切开的 think 标签与调用块边界会被重新拼装，而不是以半成品形式发出。
-* **截断判定是窄口径的。** 缺外层闭合标签是正常的模型行为，**不**当作截断。只有最后一个 `parameter` 标签未闭合，
-  或 JSON 花括号在对象中间被切断，才说明流断在参数里（`tool_block_is_truncated`）。发生这种情况时，
+* **截断判定是窄口径的。** 缺外层闭合标签是正常的模型行为，**不**当作截断。判据是
+  （`tool_block_is_truncated`）：最后一个调用块之后**一个闭合标签都没有**，且其载荷不完整
+  （最后一个 `parameter` 未闭合，或 JSON 花括号在对象中间被切断）。此时流确实断在参数里，
   该调用**完全不发出**——发出半写好的调用比不发出更糟，因为客户端会真的去执行它。随后回复以
   `finish_reason: "length"`（OpenAI）/ `stop_reason: "max_tokens"`（Anthropic）收尾，让 harness 知道该重试。
+  反之，**任何**闭合标签（包括模型把 `parameter` 误写成 `invoke` 收尾的错配形态）都说明流已走完
+  这个块，值本身是完整的，因此按 FIX 3 的容错照常发出——两种形态在字节层与「值被截断」同型，
+  无法区分，收紧判据只会把正常的错配闭合误判成截断。
 
 协议还原是 `formats.py` 的职责：`convert_anthropic_messages` 与 `_responses_input_to_messages` 把请求向内归一，
 `format_anthropic_response`、`format_responses_response` 以及逐块构造器把回复向外归一。Anthropic 流保持

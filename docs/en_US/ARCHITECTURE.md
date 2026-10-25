@@ -180,11 +180,16 @@ sometimes with full-width `｜｜` (U+FF5C) bars where ASCII `||` was expected.
   whether a prefix is plausible (`_is_plausible_stream_entry_prefix`), so think-tag and call-block
   boundaries split across network chunks are reassembled rather than emitted half-written.
 * **Truncation is judged narrowly.** A missing outer closing tag is normal model behavior and is
-  *not* treated as truncation. Only an unclosed final `parameter` tag or a JSON brace that was cut
-  mid-object means the stream ended inside an argument (`tool_block_is_truncated`). When that
-  happens the call is not emitted at all — emitting a half-written call is worse than emitting none,
+  *not* treated as truncation. The test (`tool_block_is_truncated`) is: no closing tag at all after
+  the final call block, *and* an incomplete payload (an unclosed final `parameter` tag, or a JSON
+  brace cut mid-object). Then the stream really did end inside an argument, and the call is not
+  emitted at all — emitting a half-written call is worse than emitting none,
   because the client will try to execute it. The reply then ends with `finish_reason: "length"`
   (OpenAI) / `stop_reason: "max_tokens"` (Anthropic) so the harness knows to retry.
+  Conversely, **any** closing tag — including the mismatched shape where the model ends a value
+  with `invoke` instead of `parameter` — means the stream reached the end of that block and the
+  value is complete, so FIX 3's tolerant path emits it as usual. The two shapes are byte-identical
+  to "value was cut", so tightening the rule would misjudge normal mismatched closers as truncation.
 
 Re-shaping is `formats.py`'s job: `convert_anthropic_messages` and `_responses_input_to_messages`
 normalize requests inward, `format_anthropic_response`, `format_responses_response` and the
