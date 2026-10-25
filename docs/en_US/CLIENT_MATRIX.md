@@ -18,7 +18,7 @@ and any quirks observed (field omissions, retries, body mangling):
 
 | Client | Version | Chat | Stream | Tool call | Date | Caveats |
 |---|---|---|---|---|---|---|
-| Claude Desktop | 1.46388.2 | Working | Working | Working | 2026-10-22 | setup guide: [CLAUDE_DESKTOP_SETUP.md](../CLAUDE_DESKTOP_SETUP.md) used and works fine. |
+| Claude Desktop | 1.46388.2 | Working | Working | Working | 2026-10-22 | setup guide: [CLAUDE_DESKTOP_SETUP.md](../../CLAUDE_DESKTOP_SETUP.md) used and works fine. |
 | OpenAI Python SDK | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | — |
 | Anthropic Python SDK | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | check usage fields + stop reasons |
 | Claude Code | 2.1.251 | Working | Working | Working | 2026-10-22 | Works perfectly |

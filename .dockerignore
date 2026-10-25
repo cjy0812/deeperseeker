@@ -11,3 +11,10 @@ aws_cookies_deepseek.json
 .python-version
 .pytest_cache/
 .ruff_cache
+.mypy_cache/
+# Runtime state (SQLite DB, generated api_key.txt, cookie jar, audit JSONL).
+# The globs above are anchored to the context root and do not match data/,
+# so without this line `COPY . .` bakes the live DB and the real API key
+# into the image.
+data/
+.claude/

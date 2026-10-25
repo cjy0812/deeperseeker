@@ -54,7 +54,7 @@ DeeperSeeker 运行在你自己的机器上，保管你自己的 DeepSeek 网页
 
 一张你不再去看的状态表就是一张说谎的表——把"最近验证"当作该结论的保质期。
 
-逐客户端的兼容情况见 [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md)：一次真实、带日期的运行对应一行——没跑过，就没有这一行。
+逐客户端的兼容情况见 [docs/en_US/CLIENT_MATRIX.md](docs/en_US/CLIENT_MATRIX.md)：一次真实、带日期的运行对应一行——没跑过，就没有这一行。
 
 ## 快速开始
 
@@ -238,10 +238,10 @@ API 响应里的 `cost` 就用这套统一费率。
 
 ## 项目文档
 
-- [docs/ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md)——请求生命周期、模块地图、令牌池状态机、流式与截断规则。[English](docs/ARCHITECTURE.md)
-- [docs/API.zh-CN.md](docs/API.zh-CN.md)——逐端点的鉴权、请求字段与响应形状。[English](docs/API.md)
+- [docs/zh_CN/ARCHITECTURE.md](docs/zh_CN/ARCHITECTURE.md)——请求生命周期、模块地图、令牌池状态机、流式与截断规则。[English](docs/en_US/ARCHITECTURE.md)
+- [docs/zh_CN/API.md](docs/zh_CN/API.md)——逐端点的鉴权、请求字段与响应形状。[English](docs/en_US/API.md)
 - [Claude Desktop 配置指南](CLAUDE_DESKTOP_SETUP.md)——几分钟把 Claude Desktop 接上 DeeperSeeker。
-- [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md)——哪些客户端测过、何时、结果如何。
+- [docs/en_US/CLIENT_MATRIX.md](docs/en_US/CLIENT_MATRIX.md)——哪些客户端测过、何时、结果如何。
 - [SECURITY.md](SECURITY.md)——安全问题如何上报。
 - [CONTRIBUTING.md](CONTRIBUTING.md)——补丁的分支/测试/合并仪式。
 - [CHANGELOG.md](CHANGELOG.md)——逐版本变更记录。

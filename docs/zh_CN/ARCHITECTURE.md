@@ -5,7 +5,7 @@ DeeperSeeker 是一个反向代理：把 **OpenAI 与 Anthropic 形状的 API** 
 上游会话，再把回复翻译回来。
 
 本文说明一个请求在进程里怎么走、每个模块管什么，以及让令牌池保持健康的那些不变量。逐端点的报文级参考见
-[API.zh-CN.md](API.zh-CN.md)；配置项见 [README.zh-CN.md](../README.zh-CN.md) 的配置表。
+[API.md](API.md)；配置项见 [README.zh-CN.md](../../README.zh-CN.md) 的配置表。
 
 ## 目录
 

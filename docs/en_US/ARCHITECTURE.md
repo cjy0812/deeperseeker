@@ -7,7 +7,7 @@ reply back.
 
 This document describes how a request travels through the process, what each module owns, and the
 invariants that keep the pool healthy. For the wire-level endpoint reference see
-[API.md](API.md); for configuration see the `Configuration` table in the [README](../README.md).
+[API.md](API.md); for configuration see the `Configuration` table in the [README](../../README.md).
 
 ## Contents
 

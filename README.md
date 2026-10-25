@@ -68,7 +68,7 @@ Want to use DeeperSeeker with the Claude Desktop app? Follow the
 
 A status table you stop checking is a table that lies — treat "last verified" as the claim's expiry date.
 
-Per-client compatibility lives in [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md): one row per real, dated run — no run, no row.
+Per-client compatibility lives in [docs/CLIENT_MATRIX.md](docs/en_US/CLIENT_MATRIX.md): one row per real, dated run — no run, no row.
 
 ## Quickstart
 
@@ -271,10 +271,10 @@ The `cost` reported in API responses uses these flat rates.
 
 ## Project docs
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — request lifecycle, module map, token pool state machine, streaming and truncation rules. [中文](docs/ARCHITECTURE.zh-CN.md)
-- [docs/API.md](docs/API.md) — every endpoint with its auth, request fields and response shape. [中文](docs/API.zh-CN.md)
+- [docs/en_US/ARCHITECTURE.md](docs/en_US/ARCHITECTURE.md) — request lifecycle, module map, token pool state machine, streaming and truncation rules. [中文](docs/zh_CN/ARCHITECTURE.md)
+- [docs/en_US/API.md](docs/en_US/API.md) — every endpoint with its auth, request fields and response shape. [中文](docs/zh_CN/API.md)
 - [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md) — point Claude Desktop at DeeperSeeker in a few minutes.
-- [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md) — which clients were tested, when, with what result.
+- [docs/CLIENT_MATRIX.md](docs/en_US/CLIENT_MATRIX.md) — which clients were tested, when, with what result.
 - [SECURITY.md](SECURITY.md) — how to report security issues.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — branch/test/merge ritual for patches.
 - [CHANGELOG.md](CHANGELOG.md) — what changed, release by release.

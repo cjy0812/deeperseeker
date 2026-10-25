@@ -1,7 +1,7 @@
 # API 参考
 
 DeeperSeeker 暴露的全部端点，各自需要什么鉴权，以及返回什么形状。请求在内部怎么走见
-[ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md)。
+[ARCHITECTURE.md](ARCHITECTURE.md)。
 
 示例里的基础地址是 `http://127.0.0.1:4000`（`HOST`/`PORT` 的默认值）。
 
