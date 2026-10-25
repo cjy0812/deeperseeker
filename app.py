@@ -27,6 +27,7 @@ from uvicorn.logging import AccessFormatter
 import audit
 import i18n
 import webui
+from routes.audit_api import build_router as build_audit_router
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # B12 (Stage 1 audit): the global os.chdir(BASE_DIR) is gone — every relative
@@ -4197,49 +4198,6 @@ async def health(request: Request):
     return JSONResponse(data, status_code=200 if ok else 503)
 
 
-@app.get("/v1/audit/perf")
-async def audit_perf(request: Request, window: int = 3600):
-    """Perf status: request volume, error rate, latency percentiles and the
-    recovery counters over the trailing `window` seconds.
-
-    Gated by EITHER the API key (so an operator can scrape it from the same
-    client that talks to the proxy) OR a live admin session (so the /audit
-    page can render the same roll-up without embedding the API key in the
-    browser). Read-only, best-effort: an audit-store failure is a 503, never
-    a 500, since the data is diagnostic."""
-    if not _admin_or_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    try:
-        summary = await _db(audit.perf_summary, window)
-    except Exception:
-        logger.exception("audit perf summary failed")
-        return JSONResponse({"error": "audit store unavailable"}, status_code=503)
-    summary["enabled"] = audit.enabled()
-    return JSONResponse(summary)
-
-
-@app.get("/v1/audit/rate-limits")
-async def audit_rate_limits(request: Request, since: float = None):
-    """The upstream rate-limit audit view: one row per token limited inside
-    the window, with the reason breakdown (http_429 / sse_rate_limit /
-    http_other) and how many times it auto-recovered.
-
-    Admin-gated: token ids and per-token limit counts are operational detail.
-    The dashboard / admin session is the intended caller."""
-    try:
-        # get_current_admin is synchronous (it returns "admin"): awaiting its
-        # return value raised TypeError, which the HTTPException handler below
-        # could not catch, so the admin-session path was a 500 and only the
-        # API-key path (which this endpoint does not accept) ever worked.
-        get_current_admin(request)
-    except HTTPException:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    try:
-        rows = await _db(audit.token_rate_limit_summary, since)
-    except Exception:
-        logger.exception("audit rate-limit summary failed")
-        return JSONResponse({"error": "audit store unavailable"}, status_code=503)
-    return JSONResponse({"tokens": rows, "enabled": audit.enabled()})
 async def _deep_health_probe_guarded(authorized):
     """Deep probe entry shared by the route and tests (P0-9).
 
@@ -4303,6 +4261,20 @@ async def _deep_health_probe():
         # that it exists, never the id itself
         "chat_created": bool(chat_id),
     }
+
+
+# The read-only audit endpoints live in routes/audit_api.py: they are the only
+# routes the suite exercises purely over HTTP, with no app-module patching, so
+# moving them out keeps the patching contract for everything else intact.
+# Dependencies are injected because that module cannot import app back.
+app.include_router(
+    build_audit_router(
+        admin_or_key=_admin_or_key,
+        get_current_admin=get_current_admin,
+        run_db=_db,
+        logger=logger,
+    )
+)
 
 
 def main():
