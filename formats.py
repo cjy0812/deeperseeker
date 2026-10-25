@@ -16,6 +16,7 @@ import uuid
 
 from fastapi import HTTPException, Request
 
+
 def format_anthropic_response(result, model):
     choice = result["choices"][0]
     msg = choice["message"]

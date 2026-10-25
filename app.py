@@ -24,10 +24,8 @@ from fastapi.security import HTTPBasic
 from fastapi.staticfiles import StaticFiles
 from uvicorn.logging import AccessFormatter
 
-import audit
 import i18n
 import webui
-from routes.audit_api import build_router as build_audit_router
 
 # Re-exported so that `from app import SINGLE_MODEL, convert_anthropic_messages`
 # keeps working (tests and downstream importers use app as the facade).
@@ -52,6 +50,7 @@ from formats import (  # noqa: F401
     is_thinking_enabled,
     resolve_model,
 )
+from routes.audit_api import build_router as build_audit_router
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # B12 (Stage 1 audit): the global os.chdir(BASE_DIR) is gone — every relative
@@ -64,11 +63,6 @@ security = HTTPBasic()
 
 
 from functions import (
-    effort_level,
-    request_effort,
-    request_tools,
-    token_busy,
-    CookieGenerationError,
     StreamToolParser,
     UpstreamError,
     acquire_token_slot,
@@ -79,6 +73,7 @@ from functions import (
     data_dir,
     delete_sessions_for_chat,
     delete_token,
+    effort_level,
     find_session,
     get_auth_token,
     get_file_content,
@@ -96,9 +91,12 @@ from functions import (
     pick_token,
     record_file,
     record_usage,
+    request_effort,
+    request_tools,
     restore_token,
     save_session,
     send_message,
+    token_busy,
     tool_block_is_truncated,
     upload_file,
     usage_by_day_key,
@@ -182,7 +180,6 @@ from middleware import (
     RealIPMiddleware,
     RecovererMiddleware,
     RequestIDMiddleware,
-    request_id_var,
 )
 from plugin_helper import (
     MAX_SUMMARY_TOKENS,

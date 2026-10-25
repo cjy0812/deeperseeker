@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from functions import CookieGenerationError
 from middleware import request_id_var
 
+
 def _upstream_http_code(exc):
     """HTTP status carried by an upstream failure (B6).
 
