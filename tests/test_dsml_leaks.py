@@ -310,3 +310,26 @@ def test_undeclared_residue_keys_pruned():
         ]
     finally:
         request_tools.reset(token)
+
+
+def test_residue_emptying_required_field_drops_call():
+    """Residue that blanks a required field leaves an unsatisfiable call.
+
+    The nested block ends the real value at the inner opener, so the field
+    keeps an empty string while the leftover keys show up as siblings. That
+    is a prefix of the real arguments, not a call the client can run.
+    """
+    token = request_tools.set(TOOLS)
+    try:
+        text = (
+            f'<{B}invoke name="edit">\n'
+            f'<{B}parameter name="path" string="true">a.py</{B}parameter>\n'
+            f'<{B}parameter name="old_string" string="true">'
+            f'<{B}parameter name="junk" string="true">residue</{B}parameter>\n'
+            f'<{B}parameter name="new_string" string="true">new</{B}parameter>\n'
+            f'</{B}invoke>'
+        )
+        tools, _ = parse_tools(text)
+        assert tools == []
+    finally:
+        request_tools.reset(token)
