@@ -995,7 +995,7 @@ def _code_fence_spans(text):
 
 
 _TOOL_OPEN_FAMILY_RE = re.compile(
-    r"<[\uFF5C\|]{0,2}(?:DSML[\uFF5C\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke|function_call)\b[^>]*>",
+    r"<[\uFF5C\|]{0,2}(?:DSML[\uFF5C\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke|function_call|tool_use)\b[^>]*>",
     re.IGNORECASE,
 )
 
@@ -1229,6 +1229,28 @@ def parse_tools(text):
             ).strip()
 
     if not tools and not truncated:
+        # Some upstreams emit <tool_use><name>X</name><arguments>{...}</arguments>
+        # </tool_use> instead of <invoke>/<parameter>. Without this branch the
+        # call is handed to the client as plain text and never executes.
+        tu = re.compile(
+            r"<tool_use>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</tool_use>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        for m in tu.finditer(text):
+            if fenced(m.start()):
+                continue
+            raw = m.group(2).strip()
+            try:
+                args = json.loads(raw)
+            except Exception:
+                args = None
+            norm = normalize_tool_call(m.group(1).strip(), args) if args is not None else None
+            if norm:
+                tools.append(norm)
+        if tools:
+            clean_text = tu.sub("", clean_text).strip()
+
+    if not tools and not truncated:
         fn_call_pattern = re.compile(
             r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>",
             re.DOTALL | re.IGNORECASE,
@@ -1398,7 +1420,7 @@ def parse_tools(text):
 # StreamToolParser so a mismatched closer closes the open block instead of
 # hanging until flush(). [FIX 3]
 _TOOL_END_TAG_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_calls?)\s*>",
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_calls?|tool_use)\s*>",
     re.IGNORECASE,
 )
 
@@ -1408,7 +1430,7 @@ _TOOL_END_TAG_RE = re.compile(
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
+    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke|tool_use)\b[^>]*>",
     re.IGNORECASE,
 )
 
