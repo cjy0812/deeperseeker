@@ -224,9 +224,9 @@ which sides of `raw` exist (`req` / `resp`).
 
 ### `GET /v1/audit/raw/{request_id}?direction=req|resp`
 
-**Admin session only.** Unlike the list endpoint this returns the caller's own prompt or the upstream's raw
-response, so the gate is stricter: an API key is enough to read counters, not to read someone else's
-conversation. `direction` defaults to `req`.
+Same gate as the list endpoint (**API key or admin session**). Be aware this means a leaked API key
+exposes full prompts and upstream responses — raw capture is operator-facing diagnostic data, and
+this trade-off is accepted by turning it on. `direction` defaults to `req`.
 
 Returns `{"text": "...", "direction": "req"}`. `404` means that capture is not available (no index, file pruned,
 frame corrupt); `503` means the store itself is unreadable.

@@ -103,17 +103,16 @@ def build_router(*, admin_or_key, get_current_admin, run_db, logger):
     ):
         """The captured prompt (`direction=req`) or upstream output (`resp`).
 
-        Admin session only. Unlike the list endpoint this hands back the
-        literal text a caller sent and the upstream sent back, so the gate is
-        the stricter one: an API key is enough to scrape counters, not to read
-        someone else's conversation.
+        Gated like the list endpoint (API key OR admin session), per the
+        operator's choice: raw capture is an operator-facing diagnostic, and
+        the same credential that can scrape the index may read the body. Be
+        aware this means a leaked API key exposes full prompts.
 
         404 means "no such capture" (no index, a pruned file, a corrupt
         frame); 503 means the store itself is unreadable."""
-        try:
-            get_current_admin(request)
-        except HTTPException:
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        denied = await admin_or_key(request)
+        if denied:
+            return denied
         if direction not in ("req", "resp"):
             return JSONResponse(
                 {"error": "direction must be req or resp"}, status_code=400

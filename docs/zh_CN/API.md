@@ -208,8 +208,8 @@ curl -s 'http://127.0.0.1:4000/v1/audit/raw?limit=50' \
 
 ### `GET /v1/audit/raw/{request_id}?direction=req|resp`
 
-**仅管理会话**。与列表端点不同，这里返回调用方发出的原文或上游返回的原文，所以门禁更严：
-API key 足以抓取计数器，不足以读别人的对话。`direction` 缺省为 `req`。
+与列表端点**同鉴权**（API key 或管理会话）。注意这意味着 API key 一旦泄露，泄露者能读到完整
+prompt 与上游响应——正文是运营诊断数据，接受这一权衡后再开启 raw 采集。`direction` 缺省为 `req`。
 
 返回 `{"text": "...", "direction": "req"}`。`404` 表示没有这份捕获（无索引、文件已被清理、frame 损坏），
 `503` 表示存储本身不可读。
