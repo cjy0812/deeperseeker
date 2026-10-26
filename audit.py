@@ -46,6 +46,11 @@ import sys
 import threading
 import time
 
+# Raw bodies live in their own module so this one stays standard-library-only
+# apart from this single import: audit_raw itself imports nothing from the
+# project, so there is no cycle (functions.py imports both).
+import audit_raw
+
 # Resolved exactly like functions.data_dir() so both modules address one
 # location. DB_PATH is honored; the fallback is the package's data/
 # subdirectory. functions.py recomputes these same paths on its own (it
@@ -142,6 +147,10 @@ _COLUMNS = (
     "stream",
     "attempts",
     "detail",
+    # Index into the compressed raw-body store (see audit_raw): the full
+    # prompt/response text for this exchange, redacted, lives there. A dict
+    # when written, a JSON string when read back - _coerce_raw handles both.
+    "raw",
 )
 
 # Kinds counted in perf_summary()["counters"]. A whitelist, not a filter on
@@ -181,6 +190,15 @@ def _coerce_detail(value):
         except Exception:
             value = str(value)
     return value[:_MAX_DETAIL]
+
+
+def _coerce_raw(value):
+    """The `raw` column: the raw-body index dict from audit_raw.record_raw().
+
+    Same shape handling as detail (a dict is JSON-encoded before it reaches
+    the line), but a separate name so the intent stays readable. The index is
+    roughly 200 characters, so the cap is a guard, not a real limit."""
+    return _coerce_detail(value)
 
 
 # ==============================================================================
@@ -359,6 +377,7 @@ def record(kind, **fields):
     row["ts"] = time.time()
     row["kind"] = str(kind)
     row["detail"] = _coerce_detail(fields.get("detail"))
+    row["raw"] = _coerce_raw(row.get("raw"))
     if row["stream"] is not None:
         row["stream"] = 1 if row["stream"] else 0
     for int_col in ("token_id", "upstream_status", "attempts"):
@@ -469,16 +488,23 @@ def init_audit_db(conn=None):
 # ==============================================================================
 
 
-def query_events(kind=None, token_id=None, since=None, limit=100):
+def query_events(kind=None, token_id=None, since=None, limit=100, before_seq=None):
     """Most-recent-first events. since is an epoch-seconds lower bound;
-    kind and token_id are exact filters."""
+    kind and token_id are exact filters.
+
+    before_seq is a cursor for paging: only rows with seq < before_seq are
+    returned, so a caller passes the last seq it saw to get the next page.
+    None (the default) means no cursor and preserves the old behaviour."""
     limit = max(1, min(int(limit or 100), 1000))
     tid = None if token_id is None else token_id
+    cursor = None if before_seq is None else float(before_seq)
     matched = []
     for row in _iter_events(_audit_files(since)):
         if kind is not None and row.get("kind") != kind:
             continue
         if tid is not None and row.get("token_id") != tid:
+            continue
+        if cursor is not None and _order_key(row) >= cursor:
             continue
         if since is not None:
             ts = row.get("ts")
@@ -487,6 +513,76 @@ def query_events(kind=None, token_id=None, since=None, limit=100):
         matched.append(row)
     matched.sort(key=_order_key, reverse=True)
     return matched[:limit]
+
+
+def _raw_index(row):
+    """Decode an event's `raw` column into the index dict, or None.
+
+    The column is a JSON string on disk (a dict at write time, encoded by
+    _coerce_raw); events with no captured body have no index at all."""
+    value = row.get("raw")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def raw_events(since=None, limit=50, before_seq=None):
+    """Events that carry a captured raw body, most recent first.
+
+    Metadata only - the index says which sides exist and where, but the text
+    itself stays in the compressed store until a caller asks for one body by
+    request_id. Same cursor contract as query_events: before_seq returns rows
+    with seq < before_seq."""
+    limit = max(1, min(int(limit or 50), 500))
+    cursor = None if before_seq is None else float(before_seq)
+    found = []
+    for row in _iter_events(_audit_files(since)):
+        index = _raw_index(row)
+        if not index:
+            continue
+        if cursor is not None and _order_key(row) >= cursor:
+            continue
+        ts = row.get("ts")
+        if since is not None and (
+            not isinstance(ts, (int, float)) or ts < float(since)
+        ):
+            continue
+        found.append(
+            {
+                "seq": row.get("seq"),
+                "ts": ts,
+                "request_id": row.get("request_id"),
+                "model": row.get("model"),
+                "token_id": row.get("token_id"),
+                "endpoint": row.get("endpoint"),
+                "sides": sorted(index),
+            }
+        )
+    found.sort(key=lambda item: float(item.get("seq") or 0), reverse=True)
+    return found[:limit]
+
+
+def raw_body_for(request_id, direction, since=None):
+    """The stored text for one side of one exchange, or None.
+
+    The newest matching event wins, so a request_id that somehow got recorded
+    twice serves the later capture. Directory I/O errors propagate, which is
+    the same 503 contract the other readers keep."""
+    newest = None
+    for row in _iter_events(_audit_files(since)):
+        if row.get("request_id") != request_id:
+            continue
+        index = _raw_index(row)
+        if not index:
+            continue
+        if newest is None or _order_key(row) > _order_key(newest):
+            newest = row
+    if newest is None:
+        return None
+    return audit_raw.read_body(_raw_index(newest), direction)
 
 
 def token_rate_limit_summary(since=None):
@@ -724,4 +820,11 @@ def prune_audit():
     except Exception as e:  # noqa: BLE001 - pruning is opportunistic
         _warn(f"prune failed: {e}")
         return deleted
+    # Raw bodies are pruned on their own schedule (retention days + byte cap)
+    # and their own failure domain: a broken raw directory must not roll back
+    # or mask the event prune that just succeeded.
+    try:
+        audit_raw.prune_raw()
+    except Exception as e:  # noqa: BLE001 - opportunistic, never raises out
+        _warn(f"raw prune failed: {e}")
     return deleted
