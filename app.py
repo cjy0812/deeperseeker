@@ -3302,6 +3302,19 @@ async def audit_page(request: Request):
     return webui.render(request, "audit.html")
 
 
+@app.get("/audit/raw")
+async def audit_raw_page(request: Request):
+    """The raw-text console: one row per exchange that captured bodies.
+
+    Same admin gate as /audit. The page is a shell — audit_raw.js fetches
+    /v1/audit/raw for the list and /v1/audit/raw/{request_id} per side.
+    Bodies are shown only here, never in the aggregate dashboard."""
+    denied = webui.gate(request, get_current_admin)
+    if denied:
+        return denied
+    return webui.render(request, "audit_raw.html")
+
+
 @app.get("/dashboard")
 async def dashboard(request: Request):
     denied = webui.gate(request, get_current_admin)

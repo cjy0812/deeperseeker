@@ -69,4 +69,64 @@ def build_router(*, admin_or_key, get_current_admin, run_db, logger):
             return JSONResponse({"error": "audit store unavailable"}, status_code=503)
         return JSONResponse({"tokens": rows, "enabled": audit.enabled()})
 
+    @router.get("/v1/audit/raw")
+    async def audit_raw_list(
+        request: Request,
+        since: float = None,
+        limit: int = 50,
+        before_seq: float = None,
+    ):
+        """List exchanges that carry a captured raw body, newest first.
+
+        Metadata only: each row says which sides exist and when, never the
+        text. Fetching a body is a separate, per-request call so a list page
+        never decompresses megabytes of prompt to render a row.
+
+        Gated like /v1/audit/perf (API key OR admin session): the metadata is
+        operational, the bodies behind it are guarded separately by the same
+        gate plus the explicit per-body fetch."""
+        denied = await admin_or_key(request)
+        if denied:
+            return denied
+        try:
+            events = await run_db(audit.raw_events, since, limit, before_seq)
+        except Exception:
+            logger.exception("audit raw list failed")
+            return JSONResponse(
+                {"error": "audit store unavailable"}, status_code=503
+            )
+        return JSONResponse({"events": events, "enabled": audit.enabled()})
+
+    @router.get("/v1/audit/raw/{request_id}")
+    async def audit_raw_body(
+        request: Request, request_id: str, direction: str = "req", since: float = None
+    ):
+        """The captured prompt (`direction=req`) or upstream output (`resp`).
+
+        Admin session only. Unlike the list endpoint this hands back the
+        literal text a caller sent and the upstream sent back, so the gate is
+        the stricter one: an API key is enough to scrape counters, not to read
+        someone else's conversation.
+
+        404 means "no such capture" (no index, a pruned file, a corrupt
+        frame); 503 means the store itself is unreadable."""
+        try:
+            get_current_admin(request)
+        except HTTPException:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        if direction not in ("req", "resp"):
+            return JSONResponse(
+                {"error": "direction must be req or resp"}, status_code=400
+            )
+        try:
+            text = await run_db(audit.raw_body_for, request_id, direction, since)
+        except Exception:
+            logger.exception("audit raw body read failed")
+            return JSONResponse(
+                {"error": "audit store unavailable"}, status_code=503
+            )
+        if text is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse({"text": text, "direction": direction})
+
     return router
