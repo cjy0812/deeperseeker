@@ -18,6 +18,7 @@ import deepseek_tokenizer
 import wasmtime
 
 import audit
+import audit_raw
 
 try:
     from playwright.async_api import async_playwright
@@ -1483,6 +1484,93 @@ def token_busy(auth_token):
     return bool(lock and lock.locked())
 
 
+# Raw-text capture handoff between send_message's pump() and the streaming
+# _send_message_unlocked(). A ContextVar is used rather than an argument so the
+# capture hook never changes that function's public signature (it is called
+# from app.py in several recovery paths) and so a nested/abandoned stream can
+# never write into another request's buffers. The value is a dict:
+#     {"prompt": [str], "resp": [bytes], "meta": {}}
+# Lists are mutated in place; pump() owns the dict and clears it after writing.
+_raw_capture_var = contextvars.ContextVar("deeperseeker_raw_capture", default=None)
+
+
+def _raw_capture():
+    """The capture dict for this task, or None when capture is off."""
+    cap = _raw_capture_var.get()
+    return cap if isinstance(cap, dict) else None
+
+
+def _capture_prompt(json_data):
+    """Stash the exact prompt + request knobs. Stores a reference only."""
+    cap = _raw_capture()
+    if not cap:
+        return
+    cap["prompt"].append(json_data.get("prompt"))
+    cap["meta"].update(
+        {
+            "model_type": json_data.get("model_type"),
+            "thinking_enabled": json_data.get("thinking_enabled"),
+            "search_enabled": json_data.get("search_enabled"),
+            "ref_file_ids": list(json_data.get("ref_file_ids") or []),
+        }
+    )
+
+
+def _capture_resp_chunk(raw_line):
+    """Append one raw SSE line (bytes, undecoded, unredacted)."""
+    cap = _raw_capture()
+    if not cap:
+        return
+    cap["resp"].append(raw_line)
+
+
+async def _flush_raw_capture(cap, request_id):
+    """Write the captured exchange off-loop. Never raises.
+
+    Called from pump()'s finally, so it must not mask the original exception
+    or raise a new one: everything here is best-effort auditing.
+    """
+    if not cap:
+        return
+    prompt_buf = cap.get("prompt") or []
+    resp_buf = cap.get("resp") or []
+    meta = cap.get("meta") or {}
+    if not prompt_buf and not resp_buf:
+        return
+    try:
+        prompt = None
+        if prompt_buf:
+            prompt = "".join(str(p) for p in prompt_buf if p is not None)
+        response = None
+        if resp_buf:
+            response = b"\n".join(resp_buf).decode("utf-8", "replace")
+        index = await asyncio.to_thread(
+            audit_raw.record_raw,
+            request_id,
+            prompt=prompt,
+            response=response,
+            meta=meta,
+        )
+        if index:
+            await audit.arecord("raw", raw=index, request_id=request_id)
+    except Exception:  # noqa: BLE001 - capture must never break a request
+        logger.exception("raw audit capture failed")
+    finally:
+        cap["prompt"].clear()
+        cap["resp"].clear()
+        cap["meta"].clear()
+
+
+def _current_request_id():
+    """This task's request id, or None outside a request (tests, CLI)."""
+    from middleware import request_id_var
+
+    rid = request_id_var.get()
+    if not rid or rid == "-":
+        return None
+    return rid
+
+
 async def send_message(chat_id, auth_token, *args, **kwargs):
     # The upstream stream is drained by its own task, so the lock is released when
     # DeepSeek finishes even if the consumer abandons this generator mid-stream
@@ -1493,6 +1581,12 @@ async def send_message(chat_id, auth_token, *args, **kwargs):
     done = object()
 
     async def pump():
+        cap = {"prompt": [], "resp": [], "meta": {}}
+        # request_id has to be read here: create_task copies the context, so
+        # the middleware's binding is still visible, but pump() itself runs in
+        # a task that outlives the route handler's context on cancellation.
+        request_id = _current_request_id()
+        token = _raw_capture_var.set(cap)
         try:
             async with lock:
                 gen = _send_message_unlocked(chat_id, auth_token, *args, **kwargs)
@@ -1504,6 +1598,8 @@ async def send_message(chat_id, auth_token, *args, **kwargs):
         except Exception as e:
             queue.put_nowait(e)
         finally:
+            _raw_capture_var.reset(token)
+            await _flush_raw_capture(cap, request_id)
             queue.put_nowait(done)
 
     task = asyncio.create_task(pump())
@@ -1546,6 +1642,8 @@ async def _send_message_unlocked(
         "preempt": False,
         "action": None,
     }
+    # Reference-only stash: the prompt is the caller's string, not a copy.
+    _capture_prompt(json_data)
 
     think_open = False
     got_output = False
@@ -1568,6 +1666,9 @@ async def _send_message_unlocked(
                 resp.status,
                 chat_id,
                 error_text[:300],
+            )
+            _capture_resp_chunk(
+                f"HTTP {resp.status}\n{error_text}".encode("utf-8", "replace")
             )
             raise UpstreamError(resp.status, error_text)
 
@@ -1688,6 +1789,10 @@ async def _send_message_unlocked(
             line_buf += chunk
             while b"\n" in line_buf:
                 raw_line, line_buf = line_buf.split(b"\n", 1)
+                # Capture before the empty-line skip so the stored stream is
+                # byte-faithful: blank separators are part of the wire format
+                # and dropping them would make a replay misleading.
+                _capture_resp_chunk(raw_line)
                 decoded_line = raw_line.decode("utf-8", errors="replace").strip()
                 if not decoded_line:
                     continue
@@ -1698,6 +1803,7 @@ async def _send_message_unlocked(
                     return
 
         if line_buf.strip():
+            _capture_resp_chunk(line_buf)
             decoded_line = line_buf.decode("utf-8", errors="replace").strip()
             if decoded_line:
                 try:
