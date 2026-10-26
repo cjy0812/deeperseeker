@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}{{ t('audit_raw.title') }} - DeeperSeeker{% endblock %}
+{% block head %}
+{# Shares audit.css with the counters console: both are admin-only audit
+   screens, and the raw page only adds a handful of selectors. #}
+<link rel="stylesheet" href="/static/audit.css">
+{% endblock %}
+{% block content %}
+<h1>{{ t('audit_raw.heading') }}</h1>
+
+<div class="toolbar">
+    <label for="raw-window">{{ t('audit_raw.window') }}</label>
+    <select id="raw-window">
+        <option value="3600">{{ t('audit_raw.window_1h') }}</option>
+        <option value="86400" selected>{{ t('audit_raw.window_24h') }}</option>
+        <option value="604800">{{ t('audit_raw.window_7d') }}</option>
+    </select>
+    <button type="button" id="raw-refresh">{{ t('audit_raw.refresh') }}</button>
+    <span id="raw-status" class="hint" role="status"></span>
+</div>
+
+{# Toggled by audit_raw.js; the text is resolved at load time, never built in
+   JS. The payload may contain upstream HTML, so nothing here is ever parsed as
+   markup. #}
+<p id="raw-notice" class="warning" hidden></p>
+
+<div class="raw-split">
+    <section class="raw-col">
+        {# Column labels are rendered server-side; the script only fills the
+           values, which keeps the raw page free of per-field translations. #}
+        <div class="raw-list-head">
+            <span>{{ t('audit_raw.th_time') }}</span>
+            <span>{{ t('audit_raw.th_request') }}</span>
+            <span>{{ t('audit_raw.th_model') }}</span>
+            <span>{{ t('audit_raw.th_token') }}</span>
+        </div>
+        <ul id="raw-list" class="raw-list"></ul>
+        <p id="raw-empty" class="hint" hidden>{{ t('audit_raw.empty') }}</p>
+    </section>
+
+    <section class="raw-col" id="raw-detail">
+        <p id="raw-detail-empty" class="hint">{{ t('audit_raw.pick') }}</p>
+        <div id="raw-panes" hidden>
+            <div class="raw-pane">
+                <div class="raw-pane-head">
+                    <h3>{{ t('audit_raw.prompt') }}</h3>
+                    <button type="button" id="raw-dl-prompt" disabled>
+                        {{ t('audit_raw.download') }}
+                    </button>
+                </div>
+                <pre id="raw-prompt" class="raw-pre"></pre>
+            </div>
+            <div class="raw-pane">
+                <div class="raw-pane-head">
+                    <h3>{{ t('audit_raw.response') }}</h3>
+                    <button type="button" id="raw-dl-response" disabled>
+                        {{ t('audit_raw.download') }}
+                    </button>
+                </div>
+                <pre id="raw-response" class="raw-pre"></pre>
+            </div>
+        </div>
+    </section>
+</div>
+
+{# Same contract as audit.html: every string the script writes comes from this
+   blob, shipped as JSON so a quote in a translation cannot break out of the
+   script tag. #}
+<script type="application/json" id="i18n">{{ js_i18n | tojson }}</script>
+<script src="/static/js/audit_raw.js" defer></script>
+{% endblock %}

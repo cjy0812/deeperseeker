@@ -111,8 +111,118 @@
 
 /* The "store unavailable" notice must not read as the amber advisory the
    base .warning class is styled for. */
-#notice.error {
+#notice.error,
+#raw-notice.error {
     background: #da363322;
     border-color: #da3633;
     color: #f85149;
+}
+
+/* --- raw text console --------------------------------------------------- */
+
+/* Request list on the left, the two raw payloads on the right. The split
+   collapses to one column on narrow screens: side-by-side panes of arbitrary
+   upstream text are unreadable below roughly tablet width. */
+.raw-split {
+    display: grid;
+    grid-template-columns: minmax(260px, 1fr) minmax(0, 2.4fr);
+    gap: 16px;
+    align-items: start;
+}
+
+@media (max-width: 900px) {
+    .raw-split {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.raw-col {
+    min-width: 0;
+}
+
+.raw-list-head,
+.raw-row {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr 0.6fr;
+    gap: 8px;
+    font-size: 0.85em;
+}
+
+.raw-list-head {
+    color: #8b949e;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0 8px 6px;
+    border-bottom: 1px solid #30363d;
+}
+
+.raw-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 70vh;
+    overflow: auto;
+}
+
+.raw-row {
+    padding: 6px 8px;
+    border-bottom: 1px solid #21262d;
+    cursor: pointer;
+    font-variant-numeric: tabular-nums;
+}
+
+.raw-row:hover {
+    background: #161b22;
+}
+
+.raw-row.active {
+    background: #1f6feb22;
+    box-shadow: inset 2px 0 0 #1f6feb;
+}
+
+.raw-row span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.raw-pane + .raw-pane {
+    margin-top: 16px;
+}
+
+.raw-pane-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.raw-pane-head h3 {
+    margin: 0;
+    color: #8b949e;
+    font-size: 0.9em;
+    font-weight: 600;
+}
+
+.raw-pane-head button {
+    margin-bottom: 0;
+    font-size: 0.85em;
+}
+
+/* Upstream text is arbitrary: preserve its line breaks, but wrap long lines
+   instead of forcing a horizontal scrollbar on a 60vh pane. */
+.raw-pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 60vh;
+    overflow: auto;
+    margin: 0;
+    padding: 10px 12px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 0.85em;
+    color: #c9d1d9;
 }

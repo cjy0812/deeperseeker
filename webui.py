@@ -88,6 +88,15 @@ _CLIENT_STRINGS = {
     "disabled": "audit.disabled",
     "empty": "audit.perf_empty",
     "none": "common.none",
+    # Read by audit_raw.js. Namespaced with `raw_` so the raw console cannot
+    # silently inherit a string meant for the counters page (its "disabled"
+    # and "empty" wording is different).
+    "raw_loading": "audit_raw.loading",
+    "raw_unavailable": "audit_raw.unavailable",
+    "raw_disabled": "audit_raw.disabled",
+    "raw_empty": "audit_raw.empty",
+    "raw_pick": "audit_raw.pick",
+    "raw_none": "common.none",
 }
 
 # The recovery counters, in the order the panel renders them. The keys are the
