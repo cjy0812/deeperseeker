@@ -184,6 +184,36 @@ curl -s 'http://127.0.0.1:4000/v1/audit/rate-limits' -b cookies.txt
 
 任一端点存储失败都是 `503 {"error": "audit store unavailable"}`，绝不是 `500`。
 
+## 原始文本审计
+
+记录发往上游的完整 prompt 与上游返回的原始 SSE 文本，压缩落在 `data/audit/raw/raw-YYYY-MM-DD-{req,resp}.jsonl.zst`
+（每条一个 zstd frame，按 UTC 天分文件）。正文**不**进审计事件的 `detail` 字段（那里有 2000 字符截断），
+事件上只存指向 frame 的索引。落盘前用与 `errors.py` 相同的规则遮蔽长串凭据与 `Bearer`，自然语言内容不遮蔽。
+
+默认开启，由 `DEEPSEEKER_AUDIT_RAW_ENABLED` 控制（总开关 `DEEPSEEKER_AUDIT_ENABLED` 仍然优先）。
+保留 180 天，目录总量超过 2 GiB 时从最旧的文件开始删——低量部署不会被提前裁剪。
+
+### `GET /v1/audit/raw?since=<epoch>&limit=<n>&before_seq=<seq>`
+
+与 `/v1/audit/perf` 同鉴权（API key 或管理会话）。只返回元数据，不含正文——列表页因此不会为了渲染一行
+去解压数兆的 prompt。按 `seq` 倒序，`before_seq` 用作游标翻页，`limit` 夹在 1..200。
+
+```bash
+curl -s 'http://127.0.0.1:4000/v1/audit/raw?limit=50' \
+  -H "Authorization: Bearer $DEEPSEEKER_API_KEY"
+```
+
+返回 `{"events": [...], "enabled": bool}`，每条含 `request_id`、`ts`、`model`、`token_id`，
+以及 `raw` 中哪一侧存在（`req` / `resp`）。
+
+### `GET /v1/audit/raw/{request_id}?direction=req|resp`
+
+**仅管理会话**。与列表端点不同，这里返回调用方发出的原文或上游返回的原文，所以门禁更严：
+API key 足以抓取计数器，不足以读别人的对话。`direction` 缺省为 `req`。
+
+返回 `{"text": "...", "direction": "req"}`。`404` 表示没有这份捕获（无索引、文件已被清理、frame 损坏），
+`503` 表示存储本身不可读。
+
 ## 管理界面
 
 HTML 路由，靠 `session_id` cookie 鉴权。变更类路由还会校验 Origin 头与 Host 是否一致。
@@ -195,6 +225,7 @@ HTML 路由，靠 `session_id` cookie 鉴权。变更类路由还会校验 Origi
 | `GET` | `/logout` | 清除会话 |
 | `GET` | `/lang/{code}` | 切换界面语言，存到 `ds_lang` cookie |
 | `GET` | `/audit` | 审计与性能页 |
+| `GET` | `/audit/raw` | 原始文本审计页（左侧列表，右侧 prompt / 响应详情） |
 | `GET` | `/dashboard` | 令牌池、按天 × key 的用量、文件统计 |
 | `GET` | `/` | 重定向到仪表盘 |
 | `POST` | `/tokens/add` | 表单字段 `auth_token`、`alias` |

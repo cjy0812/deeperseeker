@@ -196,6 +196,41 @@ curl -s 'http://127.0.0.1:4000/v1/audit/rate-limits' -b cookies.txt
 
 A store failure on either endpoint is `503 {"error": "audit store unavailable"}`, never a `500`.
 
+## Raw text audit
+
+Captures the full prompt sent upstream and the raw SSE text returned, compressed into
+`data/audit/raw/raw-YYYY-MM-DD-{req,resp}.jsonl.zst` (one zstd frame per body, one file pair per UTC day).
+The body **never** goes into an event's `detail` field (which truncates at 2000 characters); the event only
+carries an index pointing at the frame. Before hitting disk the text is scrubbed with the same rules as
+`errors.py` — long credential-shaped runs and `Bearer` tokens — but natural-language content is not masked.
+
+On by default, controlled by `DEEPSEEKER_AUDIT_RAW_ENABLED` (the master `DEEPSEEKER_AUDIT_ENABLED` still wins).
+Bodies are kept for 180 days; once the directory exceeds 2 GiB the oldest files are dropped, so a low-volume
+deployment keeps its full history.
+
+### `GET /v1/audit/raw?since=<epoch>&limit=<n>&before_seq=<seq>`
+
+Same auth as `/v1/audit/perf` (API key or admin session). Metadata only, no bodies — the list page must not
+decompress megabytes of prompt just to render a row. Newest `seq` first; `before_seq` is the paging cursor and
+`limit` is clamped to 1..200.
+
+```bash
+curl -s 'http://127.0.0.1:4000/v1/audit/raw?limit=50' \
+  -H "Authorization: Bearer $DEEPSEEKER_API_KEY"
+```
+
+Returns `{"events": [...], "enabled": bool}`; each row carries `request_id`, `ts`, `model`, `token_id` and
+which sides of `raw` exist (`req` / `resp`).
+
+### `GET /v1/audit/raw/{request_id}?direction=req|resp`
+
+**Admin session only.** Unlike the list endpoint this returns the caller's own prompt or the upstream's raw
+response, so the gate is stricter: an API key is enough to read counters, not to read someone else's
+conversation. `direction` defaults to `req`.
+
+Returns `{"text": "...", "direction": "req"}`. `404` means that capture is not available (no index, file pruned,
+frame corrupt); `503` means the store itself is unreadable.
+
 ## Admin UI
 
 HTML routes, authenticated by the `session_id` cookie. State-changing routes also verify the Origin
@@ -208,6 +243,7 @@ header against the Host.
 | `GET` | `/logout` | clears the session |
 | `GET` | `/lang/{code}` | switches UI language, persists in the `ds_lang` cookie |
 | `GET` | `/audit` | audit & perf page |
+| `GET` | `/audit/raw` | raw text audit page (list on the left, prompt / response detail on the right) |
 | `GET` | `/dashboard` | token pool, usage by day x key, file stats |
 | `GET` | `/` | redirects to the dashboard |
 | `POST` | `/tokens/add` | form fields `auth_token`, `alias` |

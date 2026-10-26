@@ -192,6 +192,9 @@ Copy `.env.example` to `.env` and edit your secret values. The table below is th
 | `DEEPSEEKER_AUDIT_ENABLED` | Record audit/perf events (anything other than `0`/`false`/`no`/`off` enables it) | `1` (on) |
 | `DEEPSEEKER_AUDIT_RETENTION_DAYS` | Drop audit files older than this many days (`0` disables time-based pruning) | `7` |
 | `DEEPSEEKER_AUDIT_MAX_ROWS` | Cap on retained audit rows across all files | `50000` |
+| `DEEPSEEKER_AUDIT_RAW_ENABLED` | Capture the full upstream request prompt and raw SSE response bodies (still gated by `DEEPSEEKER_AUDIT_ENABLED`) | `1` (on) |
+| `DEEPSEEKER_AUDIT_RAW_RETENTION_DAYS` | Drop raw-body files older than this many days (`0` disables time-based pruning) | `180` |
+| `DEEPSEEKER_AUDIT_RAW_MAX_BYTES` | Byte cap for the whole raw-body directory; pruning runs only once it is exceeded, so a low-volume install keeps its full history (`0` disables the cap) | `2147483648` (2 GiB) |
 | `DEEPSEEKER_RATE_LIMIT_COOLDOWN` | Seconds a rate-limited token cools before it rejoins the pool automatically | `60` |
 | `DEEPSEEKER_TOKEN_CONCURRENCY` | Soft per-token in-flight cap; at-cap tokens are used only when nothing else is free | `8` |
 | `DEEPSEEKER_QUARANTINE_AFTER_403` | Consecutive 403s that take a token out of rotation until you restore it (`0` disables escalation) | `3` |
